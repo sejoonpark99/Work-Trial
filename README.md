@@ -173,3 +173,7 @@ npm run dev
 - **Backend**: http://localhost:8000
 - **Frontend**: http://localhost:3000
 - **VNC Browser Viewer**: http://localhost:6080 (when browser automation is active)
+
+## Notices
+
+Please note that the VNC will take up alot of memory; it is better to use it if you already have an initialized container. VNC can stream a lot of data. Please be aware that there needs to be further testing for edge cases.
