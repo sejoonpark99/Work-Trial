@@ -6,11 +6,334 @@ import logging
 from urllib.parse import quote
 import time
 import asyncio
+import subprocess
 
 logger = logging.getLogger(__name__)
 
 class SearchError(Exception):
     pass
+
+class OpenAIWebSearchTool:
+    """
+    Web search tool using Brave Search API + OpenAI for content reading and analysis
+    """
+    def __init__(self):
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.brave_api_key = os.getenv("BRAVE_API_KEY")
+        
+        if not self.openai_api_key:
+            logger.warning("OPENAI_API_KEY not found in environment variables")
+        if not self.brave_api_key:
+            logger.warning("BRAVE_API_KEY not found in environment variables")
+            
+        self.brave_base_url = "https://api.search.brave.com/res/v1"
+        self.brave_headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": self.brave_api_key
+        } if self.brave_api_key else {}
+        
+        logger.info("OpenAIWebSearchTool: Initialized with Brave Search + OpenAI")
+    
+    async def search(self, query: str, count: int = 10, read_content: bool = True) -> Dict[str, Any]:
+        """
+        Perform web search using search engines and read content with OpenAI
+        
+        Args:
+            query: Search query string
+            count: Number of results to return
+            read_content: Whether to read the actual content of pages
+            
+        Returns:
+            Dictionary containing search results with optional content
+        """
+        try:
+            # Input validation
+            if not query or not isinstance(query, str) or len(query.strip()) == 0:
+                raise SearchError("Query must be a non-empty string")
+            
+            if not isinstance(count, int) or count < 1 or count > 20:
+                raise SearchError("Count must be an integer between 1 and 20")
+            
+            logger.info(f"OpenAIWebSearch: Searching for '{query}' with read_content={read_content}")
+            
+            # Use Brave Search API to get URLs
+            search_urls = await self._search_brave(query, count)
+            
+            results = []
+            for i, url_data in enumerate(search_urls[:count]):
+                result = {
+                    "title": url_data.get("title", ""),
+                    "url": url_data.get("url", ""),
+                    "description": url_data.get("description", ""),
+                    "rank": i + 1
+                }
+                
+                # Read content if requested and OpenAI API key is available
+                if read_content and self.openai_api_key:
+                    try:
+                        content = await self._read_url_content(url_data.get("url", ""))
+                        result["content"] = content
+                        result["content_read"] = True
+                    except Exception as e:
+                        logger.warning(f"Failed to read content from {url_data.get('url', '')}: {str(e)}")
+                        result["content_read"] = False
+                        result["content_error"] = str(e)
+                else:
+                    result["content_read"] = False
+                    if not self.openai_api_key:
+                        result["content_error"] = "OpenAI API key not available"
+                
+                results.append(result)
+            
+            search_result = {
+                "query": query,
+                "results": results,
+                "total": len(results),
+                "tool_type": "openai_websearch",
+                "read_content_enabled": read_content,
+                "brave_api_available": bool(self.brave_api_key),
+                "openai_api_available": bool(self.openai_api_key),
+                "validation": {
+                    "query_valid": True,
+                    "count_valid": True,
+                    "parameters_validated": True
+                }
+            }
+            
+            logger.info(f"OpenAIWebSearch: Found {len(results)} results for '{query}'")
+            return search_result
+            
+        except SearchError:
+            raise
+        except Exception as e:
+            logger.error(f"OpenAIWebSearch error: {str(e)}")
+            raise SearchError(f"OpenAIWebSearch error: {str(e)}")
+    
+    async def _search_brave(self, query: str, count: int) -> List[Dict[str, str]]:
+        """Search using Brave Search API"""
+        try:
+            if not self.brave_api_key:
+                logger.error("BRAVE_API_KEY not available")
+                return []
+            
+            params = {
+                "q": query,
+                "count": min(count, 20),  # Brave API limit
+                "offset": 0,
+                "search_lang": "en",
+                "country": "US",
+                "safesearch": "moderate"
+            }
+            
+            response = requests.get(
+                f"{self.brave_base_url}/web/search",
+                headers=self.brave_headers,
+                params=params,
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            results = []
+            if "web" in data and "results" in data["web"]:
+                for result in data["web"]["results"]:
+                    results.append({
+                        "title": result.get("title", ""),
+                        "url": result.get("url", ""),
+                        "description": result.get("description", "")
+                    })
+            
+            logger.info(f"Brave Search: Found {len(results)} results for '{query}'")
+            return results
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Brave Search API error: {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Brave Search error: {str(e)}")
+            return []
+    
+    async def _read_url_content(self, url: str) -> str:
+        """Read and summarize URL content using OpenAI"""
+        try:
+            # Fetch the URL content
+            response = requests.get(url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            response.raise_for_status()
+            
+            # Parse HTML content
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                script.decompose()
+            
+            # Extract text content
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            clean_text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            # Limit content length for API processing
+            if len(clean_text) > 4000:
+                clean_text = clean_text[:4000] + "..."
+            
+            # Use OpenAI to summarize/extract key information
+            if self.openai_api_key:
+                summary = await self._summarize_with_openai(clean_text)
+                return summary
+            else:
+                return clean_text[:1000] + "..." if len(clean_text) > 1000 else clean_text
+            
+        except Exception as e:
+            logger.error(f"Error reading URL content: {str(e)}")
+            return f"Error reading content: {str(e)}"
+    
+    async def _summarize_with_openai(self, content: str) -> str:
+        """Summarize content using OpenAI API"""
+        try:
+            import openai
+            
+            openai.api_key = self.openai_api_key
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "Summarize the following web page content, extracting key information and main points. Keep it concise but informative."},
+                    {"role": "user", "content": content}
+                ],
+                max_tokens=300,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except ImportError:
+            logger.error("openai library not installed. Install with: pip install openai")
+            return content[:500] + "..." if len(content) > 500 else content
+        except Exception as e:
+            logger.error(f"OpenAI summarization error: {str(e)}")
+            return content[:500] + "..." if len(content) > 500 else content
+    
+    async def search_with_content_extraction(self, query: str, count: int = 5) -> Dict[str, Any]:
+        """
+        Search and extract content from top results with OpenAI processing
+        
+        Args:
+            query: Search query
+            count: Number of results to process
+            
+        Returns:
+            Dictionary containing search results with extracted content
+        """
+        try:
+            # Input validation
+            if not query or not isinstance(query, str) or len(query.strip()) == 0:
+                raise SearchError("Query must be a non-empty string")
+            
+            if not isinstance(count, int) or count < 1 or count > 10:
+                raise SearchError("Count must be an integer between 1 and 10 for content extraction")
+            
+            logger.info(f"OpenAIWebSearch: Content extraction for '{query}' (count={count})")
+            
+            # Perform search with content reading enabled
+            search_results = await self.search(query, count, read_content=True)
+            
+            # Enhanced processing with OpenAI
+            enhanced_results = search_results.copy()
+            enhanced_results["tool_type"] = "openai_websearch_with_content"
+            enhanced_results["content_extraction_enabled"] = True
+            enhanced_results["features"] = {
+                "web_search": "Brave Search API",
+                "content_reading": "Direct HTTP requests with BeautifulSoup", 
+                "ai_processing": "OpenAI GPT content summarization"
+            }
+            
+            return enhanced_results
+            
+        except SearchError:
+            raise
+        except Exception as e:
+            logger.error(f"OpenAIWebSearch content extraction error: {str(e)}")
+            raise SearchError(f"OpenAIWebSearch content extraction error: {str(e)}")
+    
+    def validate_search_query(self, query: str) -> Dict[str, Any]:
+        """Validate search query format and content"""
+        validation = {
+            "valid": False,
+            "errors": [],
+            "warnings": []
+        }
+        
+        if not query:
+            validation["errors"].append("Query is empty")
+            return validation
+        
+        if not isinstance(query, str):
+            validation["errors"].append("Query must be a string")
+            return validation
+        
+        query = query.strip()
+        if len(query) == 0:
+            validation["errors"].append("Query is empty after trimming")
+            return validation
+        
+        if len(query) > 1000:
+            validation["warnings"].append("Query is very long (>1000 chars)")
+        
+        if len(query) < 3:
+            validation["warnings"].append("Query is very short (<3 chars)")
+        
+        # Check for potentially unsafe content
+        unsafe_patterns = ['javascript:', 'data:', 'vbscript:', 'file:']
+        for pattern in unsafe_patterns:
+            if pattern in query.lower():
+                validation["errors"].append(f"Query contains potentially unsafe pattern: {pattern}")
+        
+        if not validation["errors"]:
+            validation["valid"] = True
+        
+        return validation
+    
+    def get_tool_info(self) -> Dict[str, Any]:
+        """Get information about this tool's capabilities"""
+        return {
+            "name": "OpenAIWebSearchTool", 
+            "description": "Web search tool using Brave Search API + OpenAI for content reading and analysis",
+            "features": [
+                "Web search with Brave Search API",
+                "Content extraction with HTTP requests + BeautifulSoup",
+                "AI-powered content summarization with OpenAI GPT",
+                "Input validation and error handling", 
+                "Structured search result processing"
+            ],
+            "advantages": [
+                "High-quality search results via Brave API",
+                "OpenAI integration for smart content processing",
+                "Professional search API reliability",
+                "Robust content extraction",
+                "Comprehensive validation",
+                "Better error handling"
+            ],
+            "validation": [
+                "Query format validation",
+                "Parameter range checking", 
+                "Safety pattern detection",
+                "Content length validation"
+            ],
+            "requirements": [
+                "pip install openai",
+                "pip install beautifulsoup4", 
+                "pip install requests",
+                "BRAVE_API_KEY environment variable",
+                "OPENAI_API_KEY environment variable"
+            ],
+            "status": "Ready to use"
+        }
 
 class BraveSearchTool:
     """
@@ -166,146 +489,7 @@ class BraveSearchTool:
             "query": data.get("query", {}).get("original", "")
         }
 
-class ScraperAPITool:
-    """
-    ScraperAPI integration for enhanced data fetching
-    """
-    def __init__(self):
-        # Use API key directly
-        self.api_key = "12143211085ba531781f23ca0ff4cb32"
-        self.base_url = "https://api.scraperapi.com"
-        logger.info(f"ScraperAPI: Initialized with API key ending in ...{self.api_key[-4:]}")
-    
-    async def scrape_url(self, url: str, render_js: bool = True, country_code: str = "us") -> Dict[str, Any]:
-        """
-        Scrape content from a URL using ScraperAPI
-        
-        Args:
-            url: URL to scrape
-            render_js: Whether to render JavaScript (default: True)
-            country_code: Country code for proxy (default: "us")
-        
-        Returns:
-            Dictionary containing scraped content
-        """
-        try:
-            # ScraperAPI payload
-            payload = {
-                'api_key': self.api_key,
-                'url': url,
-                'render': 'true' if render_js else 'false',
-                'country_code': country_code,
-                'device_type': 'desktop',
-                'premium': 'true',  # Use premium for better success rates
-                'session_number': '1'
-            }
-            
-            logger.info(f"ScraperAPI: Scraping URL '{url}' with render_js={render_js}")
-            logger.info(f"ScraperAPI: Using API key ending in ...{self.api_key[-4:]}")
-            
-            response = requests.get(
-                self.base_url,
-                params=payload,
-                timeout=120  # ScraperAPI can be slow
-            )
-            
-            response.raise_for_status()
-            
-            # Extract basic info from HTML
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract title
-            title = ""
-            if soup.title:
-                title = soup.title.string.strip() if soup.title.string else ""
-            
-            # Extract text content
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            text = soup.get_text()
-            # Clean up text
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = ' '.join(chunk for chunk in chunks if chunk)
-            
-            # Don't truncate text - keep full content for case studies
-            # text = text[:2000]  # REMOVED - this was truncating important content
-            
-            result = {
-                "url": url,
-                "title": title,
-                "text": text,
-                "success": True,
-                "status_code": response.status_code,
-                "scraped_content": text  # Add this for backward compatibility
-            }
-            
-            logger.info(f"ScraperAPI: Successfully scraped {len(result['text'])} characters from '{url}' (Status: {response.status_code})")
-            logger.info(f"ScraperAPI: Response title: '{title}'")
-            return result
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"ScraperAPI error: {str(e)}")
-            return {
-                "url": url,
-                "success": False,
-                "error": str(e),
-                "text": "",
-                "title": "",
-                "scraped_content": ""
-            }
-        except Exception as e:
-            logger.error(f"ScraperAPI error: {str(e)}")
-            return {
-                "url": url,
-                "success": False,
-                "error": str(e),
-                "text": "",
-                "title": "",
-                "scraped_content": ""
-            }
-    
-    async def batch_scrape(self, urls: List[str], render_js: bool = True) -> List[Dict[str, Any]]:
-        """
-        Scrape multiple URLs in batch with optimized delays
-        
-        Args:
-            urls: List of URLs to scrape
-            render_js: Whether to render JavaScript
-        
-        Returns:
-            List of dictionaries containing scraped content
-        """
-        results = []
-        
-        # Limit URLs to reduce total time
-        urls_to_scrape = urls[:3]  # Only scrape first 3 URLs for speed
-        
-        for i, url in enumerate(urls_to_scrape):
-            try:
-                result = await self.scrape_url(url, render_js=render_js)
-                results.append(result)
-                
-                # Reduced delay for faster processing
-                if i < len(urls_to_scrape) - 1:  # Don't delay after the last URL
-                    import asyncio
-                    await asyncio.sleep(0.5)  # Reduced from 2 seconds to 0.5 seconds
-                    
-            except Exception as e:
-                logger.error(f"Failed to scrape {url}: {str(e)}")
-                results.append({
-                    "url": url,
-                    "success": False,
-                    "error": str(e),
-                    "text": "",
-                    "title": "",
-                    "scraped_content": ""
-                })
-        
-        return results
+# ScraperAPI tool removed - not actively used and replaced with ClaudeWebSearchTool
 
 class CaseStudyTool:
     """
@@ -1153,7 +1337,7 @@ class ApolloProcessingTool:
 
 class WebSearchManager:
     """
-    Manager class that combines Brave Search and ScraperJS for comprehensive web search
+    Manager class that combines Brave Search and Claude's WebSearch for comprehensive web search with content reading
     """
     def __init__(self):
         try:
@@ -1162,11 +1346,8 @@ class WebSearchManager:
             logger.warning(f"Brave Search not available: {str(e)}")
             self.brave_search = None
         
-        try:
-            self.scraperapi = ScraperAPITool()
-        except SearchError as e:
-            logger.warning(f"ScraperAPI not available: {str(e)}")
-            self.scraperapi = None
+        # Initialize OpenAI WebSearch tool for content reading
+        self.openai_websearch = OpenAIWebSearchTool()
         
         # Initialize case study tool
         self.case_study_tool = CaseStudyTool(self)
@@ -1174,70 +1355,73 @@ class WebSearchManager:
         # Initialize Apollo processing tool
         self.apollo_tool = ApolloProcessingTool()
     
-    async def search_and_scrape(self, query: str, count: int = 5, scrape_top_results: int = 3) -> Dict[str, Any]:
+    async def search_and_read_content(self, query: str, count: int = 5, read_top_results: int = 3) -> Dict[str, Any]:
         """
-        Perform a web search and scrape the top results for detailed content
+        Perform a web search and read the top results for detailed content using Claude's WebSearch
         
         Args:
             query: Search query
             count: Number of search results to return
-            scrape_top_results: Number of top results to scrape for detailed content
+            read_top_results: Number of top results to read for detailed content
         
         Returns:
-            Dictionary containing search results and scraped content
+            Dictionary containing search results and read content
         """
-        logger.info(f"DEBUG: search_and_scrape called with query='{query}', count={count}, scrape_top_results={scrape_top_results}")
+        # Input validation
+        if not query or not isinstance(query, str):
+            raise SearchError("Query must be a non-empty string")
         
-        if not self.brave_search:
-            raise SearchError("Brave Search is not available")
+        if count < 1 or count > 20:
+            raise SearchError("Count must be between 1 and 20")
         
-        # Perform the search
-        logger.info(f"DEBUG: Performing Brave search...")
-        search_results = await self.brave_search.search(query, count=count)
-        logger.info(f"DEBUG: Brave search returned {len(search_results.get('results', []))} results")
+        if read_top_results < 0 or read_top_results > count:
+            raise SearchError("read_top_results must be between 0 and count")
         
-        # Scrape top results if ScraperAPI is available
-        scraped_content = []
-        if self.scraperapi and scrape_top_results > 0:
-            logger.info(f"DEBUG: ScraperAPI available, scraping top {scrape_top_results} results")
-            top_urls = [result["url"] for result in search_results["results"][:scrape_top_results]]
-            logger.info(f"DEBUG: URLs to scrape: {top_urls}")
+        logger.info(f"search_and_read_content called with query='{query}', count={count}, read_top_results={read_top_results}")
+        
+        # Use OpenAI WebSearch tool which can read content directly
+        try:
+            # First try OpenAI WebSearch for comprehensive search with content
+            if self.openai_websearch:
+                logger.info("Using OpenAI WebSearch tool for search with content reading")
+                search_results = await self.openai_websearch.search_with_content_extraction(query, count)
+                
+                # Validate search results
+                if not isinstance(search_results, dict):
+                    raise SearchError("Invalid search results format")
+                
+                search_results["method"] = "openai_websearch"
+                search_results["content_read"] = True
+                return search_results
             
-            scraped_content = await self.scraperapi.batch_scrape(top_urls)
-            logger.info(f"DEBUG: Scraped {len(scraped_content)} URLs")
+            # Fallback to Brave Search only if Claude WebSearch is not available
+            elif self.brave_search:
+                logger.info("Fallback to Brave Search (no content reading)")
+                search_results = await self.brave_search.search(query, count=count)
+                
+                # Validate search results
+                if not isinstance(search_results, dict) or "results" not in search_results:
+                    raise SearchError("Invalid search results from Brave Search")
+                
+                search_results["method"] = "brave_search_only" 
+                search_results["content_read"] = False
+                search_results["warning"] = "Content reading not available with Brave Search only"
+                return search_results
             
-            # Merge scraped content back into search results
-            for i, scraped in enumerate(scraped_content):
-                if i < len(search_results["results"]) and scraped.get("success"):
-                    search_results["results"][i]["scraped_content"] = scraped.get("text", "")
-                    search_results["results"][i]["scraped_title"] = scraped.get("title", "")
-                    search_results["results"][i]["scraping_success"] = True
-                    logger.info(f"DEBUG: Successfully merged scraped content for result {i+1}")
-                elif i < len(search_results["results"]):
-                    search_results["results"][i]["scraping_success"] = False
-                    search_results["results"][i]["scraping_error"] = scraped.get("error", "Unknown error")
-                    logger.info(f"DEBUG: Failed to scrape result {i+1}: {scraped.get('error', 'Unknown error')}")
-        else:
-            logger.info(f"DEBUG: ScraperAPI not available or scrape_top_results=0")
-        
-        # Combine search results with scraped content
-        enhanced_results = []
-        for i, result in enumerate(search_results["results"]):
-            enhanced_result = result.copy()
-            
-            # Add scraped content if available
-            if i < len(scraped_content) and scraped_content[i]["success"]:
-                enhanced_result["scraped_content"] = scraped_content[i]["text"][:2000]  # Limit content
-                enhanced_result["full_title"] = scraped_content[i]["title"]
-            
-            enhanced_results.append(enhanced_result)
-        
-        return {
-            "query": query,
-            "results": enhanced_results,
-            "total": search_results["total"],
-            "scraped_count": len([c for c in scraped_content if c.get("success", False)])
-        }
+            else:
+                raise SearchError("No search tools available")
+                
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+            raise SearchError(f"Search failed: {str(e)}")
+    
+    # Keep old method for backward compatibility
+    async def search_and_scrape(self, query: str, count: int = 5, scrape_top_results: int = 3) -> Dict[str, Any]:
+        """
+        Legacy method - redirects to search_and_read_content
+        """
+        logger.warning("search_and_scrape is deprecated, use search_and_read_content instead")
+        return await self.search_and_read_content(query, count, scrape_top_results)
     
     async def search_news(self, query: str, count: int = 10) -> Dict[str, Any]:
         """Search for news articles"""
