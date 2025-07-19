@@ -10,7 +10,7 @@ import { Separator } from "@/components/ui/separator";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { BrainIcon, ZapIcon, TrendingUpIcon } from "lucide-react";
+import { BrainIcon, ZapIcon, TrendingUpIcon, Globe } from "lucide-react";
 
 interface HealthStatus {
   status: string;
@@ -25,44 +25,61 @@ export const Assistant = () => {
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [agentMode, setAgentMode] = useState<boolean>(false);
+  const [browserAutomationEnabled, setBrowserAutomationEnabled] = useState<boolean>(false);
   
   const runtime = useChatRuntime({
     api: "/api/chat",
-    body: {
-      agent_mode: agentMode ? 'agent' : 'chat'
-    },
-    maxTokens: 100, // Force shorter chunks for immediate streaming
-    streamMode: "stream-data", // Enable immediate streaming  
-    experimental_streamingReactComponents: true, // Force immediate updates
+    credentials: "same-origin",
+    maxTokens: 100,
+    streamMode: "stream-data",
+    experimental_streamingReactComponents: true,
     onToolCall: (toolCall) => {
       console.log("Runtime received tool call IMMEDIATELY:", toolCall);
+    },
+    // Pass additional data in the correct format
+    fetch: async (url, options) => {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...options?.headers,
+          'Content-Type': 'application/json',
+        },
+        body: options?.body ? (() => {
+          const originalBody = JSON.parse(options.body as string);
+          return JSON.stringify({
+            ...originalBody,
+            agent_mode: agentMode ? 'agent' : 'chat'
+          });
+        })() : undefined
+      });
+      return response;
     }
   });
 
 
-  useEffect(() => {
-    const checkHealth = async () => {
-      try {
-        const response = await fetch('/api/health');
-        const data = await response.json();
-        setHealthStatus(data);
-        console.log('Health Check Result:', data);
-      } catch (error) {
-        console.error('Health check failed:', error);
-        setHealthStatus({
-          status: 'error',
-          timestamp: new Date().toISOString()
-        });
-      } finally {
-        setIsLoading(false);
-      }
-    };
+  // useEffect(() => {
+  //   const checkHealth = async () => {
+  //     try {
+  //       const response = await fetch('/api/health');
+  //       const data = await response.json();
+  //       setHealthStatus(data);
+  //       // console.log('Health Check Result:', data);
+  //     } catch (error) {
+  //       console.error('Health check failed:', error);
+  //       setHealthStatus({
+  //         status: 'error',
+  //         timestamp: new Date().toISOString()
+  //       });
+  //     } finally {
+  //       setIsLoading(false);
+  //     }
+  //   };
     
-    checkHealth();
-    // Check health every 30 seconds
-    const interval = setInterval(checkHealth, 30000);
-    return () => clearInterval(interval);
-  }, []);
+  //   checkHealth();
+  //   // Check health every 30 seconds
+  //   const interval = setInterval(checkHealth, 300000);
+  //   return () => clearInterval(interval);
+  // }, []);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -143,8 +160,9 @@ export const Assistant = () => {
               </Breadcrumb>
             </div>
             
-            {/* Enhanced Agent Mode Toggle */}
+            {/* Enhanced Controls */}
             <div className="ml-auto flex items-center gap-6">
+              {/* Agent Mode Toggle */}
               <motion.div 
                 className="flex items-center gap-3"
                 whileHover={{ scale: 1.02 }}
@@ -172,6 +190,39 @@ export const Assistant = () => {
                   )}
                   <span className="relative z-10">
                     {agentMode ? 'ON' : 'OFF'}
+                  </span>
+                </motion.button>
+              </motion.div>
+
+              {/* Browser Automation Toggle */}
+              <motion.div 
+                className="flex items-center gap-3"
+                whileHover={{ scale: 1.02 }}
+              >
+                <span className="text-sm font-medium text-slate-600">Browser Automation:</span>
+                <motion.button
+                  onClick={() => setBrowserAutomationEnabled(!browserAutomationEnabled)}
+                  className={`relative px-4 py-2 rounded-lg text-sm font-medium transition-all duration-300 flex items-center gap-2 ${
+                    browserAutomationEnabled 
+                      ? 'bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-lg' 
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  {browserAutomationEnabled && (
+                    <motion.div
+                      className="absolute inset-0 bg-gradient-to-r from-blue-400 to-indigo-400 rounded-lg opacity-50"
+                      animate={{ 
+                        scale: [1, 1.1, 1],
+                        opacity: [0.5, 0.8, 0.5] 
+                      }}
+                      transition={{ duration: 2, repeat: Infinity }}
+                    />
+                  )}
+                  <Globe className="h-4 w-4 relative z-10" />
+                  <span className="relative z-10">
+                    {browserAutomationEnabled ? 'ON' : 'OFF'}
                   </span>
                 </motion.button>
               </motion.div>
@@ -225,7 +276,7 @@ export const Assistant = () => {
               </motion.div>
             </div>
           </motion.header>
-          <Thread />
+          <Thread forceBrowserAutomation={browserAutomationEnabled} />
         </SidebarInset>
         </SidebarProvider>
       </ThoughtCardProvider>

@@ -1,8 +1,37 @@
 const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:8000';
 
+export async function GET() {
+  return Response.json({ 
+    status: 'ok', 
+    message: 'Chat API endpoint is working',
+    timestamp: new Date().toISOString()
+  });
+}
+
 export async function POST(req: Request) {
   try {
-    const { messages, system, tools, agent_mode } = await req.json();
+    // Debug the incoming request
+    console.log('Request method:', req.method);
+    console.log('Request headers:', Object.fromEntries(req.headers.entries()));
+    
+    // Check if request has body
+    const body = await req.text();
+    console.log('Request body:', body);
+    
+    if (!body || body.trim() === '') {
+      throw new Error('Request body is empty');
+    }
+    
+    // Try to parse the JSON
+    let requestData;
+    try {
+      requestData = JSON.parse(body);
+    } catch (parseError) {
+      console.error('JSON parse error:', parseError);
+      throw new Error('Invalid JSON in request body');
+    }
+    
+    const { messages, system, tools, agent_mode } = requestData;
     
     // Convert messages to our backend format
     const backendMessages = messages.map((msg: any) => ({
@@ -60,6 +89,29 @@ export async function POST(req: Request) {
       const stream = new ReadableStream({
         start(controller) {
           let buffer = '';
+          let isClosed = false;
+          
+          const safeEnqueue = (data: Uint8Array) => {
+            if (!isClosed) {
+              try {
+                controller.enqueue(data);
+              } catch (error) {
+                console.error('Enqueue error:', error);
+                isClosed = true;
+              }
+            }
+          };
+          
+          const safeClose = () => {
+            if (!isClosed) {
+              try {
+                controller.close();
+                isClosed = true;
+              } catch (error) {
+                console.error('Close error:', error);
+              }
+            }
+          };
           
           const pump = async () => {
             try {
@@ -68,7 +120,7 @@ export async function POST(req: Request) {
                 if (done) {
                   // Send any remaining buffer
                   if (buffer.trim()) {
-                    controller.enqueue(new TextEncoder().encode(buffer));
+                    safeEnqueue(new TextEncoder().encode(buffer));
                   }
                   break;
                 }
@@ -91,15 +143,22 @@ export async function POST(req: Request) {
                     console.log('Streaming line:', line);
                     
                     // Send each complete line immediately
-                    controller.enqueue(new TextEncoder().encode(line + '\n'));
+                    safeEnqueue(new TextEncoder().encode(line + '\n'));
                   }
                 }
               }
             } catch (error) {
               console.error('Streaming error:', error);
-              controller.error(error);
+              if (!isClosed) {
+                try {
+                  controller.error(error);
+                  isClosed = true;
+                } catch (e) {
+                  console.error('Error reporting error:', e);
+                }
+              }
             } finally {
-              controller.close();
+              safeClose();
             }
           };
           pump();

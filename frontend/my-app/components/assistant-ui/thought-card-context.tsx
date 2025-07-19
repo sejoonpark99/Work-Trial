@@ -17,9 +17,11 @@ interface ThoughtCardContextType {
   }>;
   liveText: string;
   isTyping: boolean;
+  fileWriting: any;
   startThinking: (initialText?: string) => (() => void);
   addStep: (text: string, meta?: string, type?: 'step' | 'thinking' | 'executing' | 'complete') => void;
   updateLiveText: (text: string, typing?: boolean) => void;
+  updateFileWriting: (fileData: any) => void;
   complete: () => void;
   error: () => void;
   hide: () => void;
@@ -70,6 +72,16 @@ export const useThoughtCardWithStreaming = () => {
   const thoughtCard = useThoughtCard();
 
   const handleStreamingData = useCallback((data: any) => {
+    // Reset thought card state when starting a new message
+    if (data.type === 'new_message_start' || (data.type === 'step_start' && thoughtCard.status === 'completed')) {
+      thoughtCard.reset();
+    }
+
+    // Don't process new data if thought card is already completed (unless it's a reset)
+    if (thoughtCard.status === 'completed' && data.type !== 'new_message_start') {
+      return;
+    }
+
     if (data.type === 'thought_card') {
       // Handle different thought card types
       switch (data.card_type) {
@@ -97,6 +109,19 @@ export const useThoughtCardWithStreaming = () => {
           thoughtCard.updateLiveText(data.content, data.typing !== false);
           break;
         
+        case 'file_writing':
+        case 'file_complete':
+          thoughtCard.updateFileWriting({
+            filename: data.filename,
+            file_path: data.file_path,
+            file_type: data.file_type,
+            content: data.content,
+            progress: data.progress,
+            writing: data.writing,
+            size: data.size
+          });
+          break;
+        
         default:
           thoughtCard.addStep(data.content, data.meta, 'step');
       }
@@ -109,11 +134,6 @@ export const useThoughtCardWithStreaming = () => {
     } else if (data.type === 'final_message') {
       // Complete thought card when final message arrives
       thoughtCard.complete();
-      
-      // Auto-hide after a delay
-      setTimeout(() => {
-        thoughtCard.hide();
-      }, 3000);
     }
   }, [thoughtCard]);
 

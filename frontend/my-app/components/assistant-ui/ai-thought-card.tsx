@@ -53,8 +53,8 @@ export const AIThoughtCard: React.FC<AIThoughtCardProps> = ({
 
   // Format thinking time
   const formatThinkingTime = (seconds: number) => {
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+    if (seconds < 60) return `${seconds}s`;
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   };
 
   const handleMinimize = () => {
@@ -241,8 +241,16 @@ export const useAIThoughtCard = () => {
   const [steps, setSteps] = useState<ThoughtStep[]>([]);
   const [liveText, setLiveText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [fileWriting, setFileWriting] = useState(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   const startThinking = (initialText?: string) => {
+    // Clear any existing timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+
     setIsVisible(true);
     setStatus('processing');
     setProgress(0);
@@ -253,11 +261,16 @@ export const useAIThoughtCard = () => {
 
     // Start thinking timer
     const startTime = Date.now();
-    const timer = setInterval(() => {
-      setThinkingTime((Date.now() - startTime) / 1000);
-    }, 100);
+    timerRef.current = setInterval(() => {
+      setThinkingTime(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
 
-    return () => clearInterval(timer);
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
   };
 
   const addStep = (text: string, meta?: string, type: ThoughtStep['type'] = 'step') => {
@@ -276,6 +289,10 @@ export const useAIThoughtCard = () => {
     setIsTyping(typing);
   };
 
+  const updateFileWriting = (fileData: any) => {
+    setFileWriting(fileData);
+  };
+
   const complete = () => {
     setStatus('completed');
     setProgress(100);
@@ -292,6 +309,12 @@ export const useAIThoughtCard = () => {
   };
 
   const reset = () => {
+    // Clear any existing timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+
     setIsVisible(false);
     setStatus('processing');
     setProgress(0);
@@ -299,6 +322,7 @@ export const useAIThoughtCard = () => {
     setSteps([]);
     setLiveText('');
     setIsTyping(false);
+    setFileWriting(null);
   };
 
   return {
@@ -309,9 +333,11 @@ export const useAIThoughtCard = () => {
     steps,
     liveText,
     isTyping,
+    fileWriting,
     startThinking,
     addStep,
     updateLiveText,
+    updateFileWriting,
     complete,
     error,
     hide,

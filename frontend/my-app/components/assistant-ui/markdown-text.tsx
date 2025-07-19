@@ -9,8 +9,8 @@ import {
   useIsMarkdownCodeBlock,
 } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
-import { FC, memo, useState } from "react";
-import { CheckIcon, CopyIcon } from "lucide-react";
+import { FC, memo, useState, useEffect, useRef } from "react";
+import { CheckIcon, CopyIcon, ExternalLinkIcon } from "lucide-react";
 
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { cn } from "@/lib/utils";
@@ -64,6 +64,133 @@ const useCopyToClipboard = ({
   return { isCopied, copyToClipboard };
 };
 
+interface LinkPreview {
+  title?: string;
+  description?: string;
+  image?: string;
+  url: string;
+}
+
+const LinkWithPreview: FC<{ href?: string; children: React.ReactNode; className?: string }> = ({
+  href,
+  children,
+  className,
+  ...props
+}) => {
+  const [preview, setPreview] = useState<LinkPreview | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const timeoutRef = useRef<NodeJS.Timeout>();
+  const linkRef = useRef<HTMLAnchorElement>(null);
+
+  const fetchLinkPreview = async (url: string) => {
+    try {
+      setIsLoading(true);
+      const response = await fetch(`/api/link-preview?url=${encodeURIComponent(url)}`);
+      if (response.ok) {
+        const data = await response.json();
+        setPreview(data);
+      }
+    } catch (error) {
+      console.error('Failed to fetch link preview:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleMouseEnter = (e: React.MouseEvent) => {
+    if (!href) return;
+    
+    const rect = linkRef.current?.getBoundingClientRect();
+    if (rect) {
+      setPosition({
+        x: rect.left + rect.width / 2,
+        y: rect.bottom + 8
+      });
+    }
+
+    timeoutRef.current = setTimeout(() => {
+      setShowPreview(true);
+      if (!preview) {
+        fetchLinkPreview(href);
+      }
+    }, 500);
+  };
+
+  const handleMouseLeave = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+    }
+    setShowPreview(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <>
+      <a
+        ref={linkRef}
+        href={href}
+        className={cn("text-primary font-medium underline underline-offset-4 relative", className)}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+        {...props}
+      >
+        {children}
+      </a>
+      
+      {showPreview && (
+        <div
+          className="fixed z-50 bg-white border border-gray-200 rounded-lg shadow-lg p-4 max-w-sm"
+          style={{
+            left: position.x - 150, // Center the preview
+            top: position.y,
+          }}
+        >
+          {isLoading ? (
+            <div className="flex items-center gap-2">
+              <div className="animate-spin rounded-full h-4 w-4 border-2 border-blue-500 border-t-transparent" />
+              <span className="text-sm text-gray-600">Loading preview...</span>
+            </div>
+          ) : preview ? (
+            <div className="space-y-2">
+              {preview.image && (
+                <img 
+                  src={preview.image} 
+                  alt={preview.title}
+                  className="w-full h-32 object-cover rounded"
+                />
+              )}
+              {preview.title && (
+                <h3 className="font-semibold text-sm line-clamp-2">{preview.title}</h3>
+              )}
+              {preview.description && (
+                <p className="text-xs text-gray-600 line-clamp-3">{preview.description}</p>
+              )}
+              <div className="flex items-center gap-1 text-xs text-gray-500">
+                <ExternalLinkIcon className="h-3 w-3" />
+                <span className="truncate">{new URL(href || '').hostname}</span>
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <ExternalLinkIcon className="h-4 w-4 text-gray-400" />
+              <span className="text-sm text-gray-600">No preview available</span>
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+};
+
 const defaultComponents = memoizeMarkdownComponents({
   h1: ({ className, ...props }) => (
     <h1 className={cn("mb-8 scroll-m-20 text-4xl font-extrabold tracking-tight last:mb-0", className)} {...props} />
@@ -86,9 +213,7 @@ const defaultComponents = memoizeMarkdownComponents({
   p: ({ className, ...props }) => (
     <p className={cn("mb-5 mt-5 leading-7 first:mt-0 last:mb-0", className)} {...props} />
   ),
-  a: ({ className, ...props }) => (
-    <a className={cn("text-primary font-medium underline underline-offset-4", className)} {...props} />
-  ),
+  a: LinkWithPreview,
   blockquote: ({ className, ...props }) => (
     <blockquote className={cn("border-l-2 pl-6 italic", className)} {...props} />
   ),

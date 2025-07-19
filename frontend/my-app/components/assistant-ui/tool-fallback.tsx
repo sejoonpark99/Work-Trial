@@ -5,6 +5,7 @@ import { Button } from "../ui/button";
 import { ThoughtCard } from "./thought-card";
 import { addStepData, clearAllSteps, StepManager } from "./step-manager";
 import { EmailPreview } from "./email-preview";
+import { FilePreview } from "./file-preview";
 import { useThoughtCard } from "./thought-card-context";
 import { CaseStudyTool } from "./case-study-tool";
 
@@ -16,7 +17,7 @@ export const ToolFallback: ToolCallContentPartComponent = ({
   const [cardData, setCardData] = useState(null);
   const thoughtCard = useThoughtCard();
   
-  console.log("ToolFallback called with:", { toolName, argsText, result });
+  // console.log("ToolFallback called with:", { toolName, argsText, result });
   
   // Handle thought cards specially
   useEffect(() => {
@@ -37,32 +38,29 @@ export const ToolFallback: ToolCallContentPartComponent = ({
           return;
         }
         
-        // argsText should be a JSON string from our backend
+        // argsText should be an object or JSON string from our backend
         let parsedCardData;
         if (typeof argsText === 'string') {
           const trimmed = argsText.trim();
           
-          // Skip obviously incomplete JSON (empty or doesn't start with { or ")
-          if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('"'))) {
+          // Skip obviously incomplete JSON (empty or doesn't start with {)
+          if (!trimmed || !trimmed.startsWith('{')) {
             console.log("Skipping incomplete JSON during streaming:", trimmed);
             return;
           }
           
           try {
-            // Handle double-escaped JSON strings
-            let parsed = JSON.parse(trimmed);
-            if (typeof parsed === 'string') {
-              // If we get a string, parse it again (double-escaped)
-              parsed = JSON.parse(parsed);
-            }
-            parsedCardData = parsed;
+            parsedCardData = JSON.parse(trimmed);
           } catch (parseError) {
             console.log("Failed to parse JSON during streaming:", parseError);
             return;
           }
-        } else {
-          // If argsText is already an object (sometimes happens with streaming)
+        } else if (typeof argsText === 'object' && argsText !== null) {
+          // If argsText is already an object (new simplified format)
           parsedCardData = argsText;
+        } else {
+          console.log("Unexpected argsText type:", typeof argsText);
+          return;
         }
         
         // Skip empty cards
@@ -148,6 +146,31 @@ export const ToolFallback: ToolCallContentPartComponent = ({
       }
     } catch (e) {
       console.error("Error parsing case study data:", e);
+    }
+  }
+
+  // Handle file_write tool specially
+  if (toolName === "file_write") {
+    try {
+      let fileData;
+      if (typeof result === 'string') {
+        fileData = JSON.parse(result);
+      } else {
+        fileData = result;
+      }
+
+      if (fileData && fileData.path && fileData.content !== undefined) {
+        return (
+          <FilePreview
+            content={fileData.content}
+            path={fileData.path}
+            filename={fileData.filename}
+            fileType={fileData.file_type}
+          />
+        );
+      }
+    } catch (e) {
+      console.error("Error parsing file data:", e);
     }
   }
 
