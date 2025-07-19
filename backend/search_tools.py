@@ -166,99 +166,143 @@ class BraveSearchTool:
             "query": data.get("query", {}).get("original", "")
         }
 
-class ScraperJSTool:
+class ScraperAPITool:
     """
-    ScraperJS API integration for enhanced data fetching
+    ScraperAPI integration for enhanced data fetching
     """
     def __init__(self):
-        self.api_key = os.getenv("SCRAPERJS_API_KEY")
-        if not self.api_key:
-            raise SearchError("SCRAPERJS_API_KEY environment variable not set")
-        
-        self.base_url = "https://api.scraperjs.com/v1"
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
+        # Use API key directly
+        self.api_key = "12143211085ba531781f23ca0ff4cb32"
+        self.base_url = "https://api.scraperapi.com"
+        logger.info(f"ScraperAPI: Initialized with API key ending in ...{self.api_key[-4:]}")
     
-    async def scrape_url(self, url: str, extract_text: bool = True, extract_links: bool = False) -> Dict[str, Any]:
+    async def scrape_url(self, url: str, render_js: bool = True, country_code: str = "us") -> Dict[str, Any]:
         """
-        Scrape content from a URL using ScraperJS API
+        Scrape content from a URL using ScraperAPI
         
         Args:
             url: URL to scrape
-            extract_text: Whether to extract text content
-            extract_links: Whether to extract links
+            render_js: Whether to render JavaScript (default: True)
+            country_code: Country code for proxy (default: "us")
         
         Returns:
             Dictionary containing scraped content
         """
         try:
+            # ScraperAPI payload
             payload = {
-                "url": url,
-                "extract_text": extract_text,
-                "extract_links": extract_links,
-                "timeout": 30000,
-                "wait_for": 3000
+                'api_key': self.api_key,
+                'url': url,
+                'render': 'true' if render_js else 'false',
+                'country_code': country_code,
+                'device_type': 'desktop',
+                'premium': 'true',  # Use premium for better success rates
+                'session_number': '1'
             }
             
-            logger.info(f"ScraperJS: Scraping URL '{url}'")
+            logger.info(f"ScraperAPI: Scraping URL '{url}' with render_js={render_js}")
+            logger.info(f"ScraperAPI: Using API key ending in ...{self.api_key[-4:]}")
             
-            response = requests.post(
-                f"{self.base_url}/scrape",
-                headers=self.headers,
-                json=payload,
-                timeout=60
+            response = requests.get(
+                self.base_url,
+                params=payload,
+                timeout=120  # ScraperAPI can be slow
             )
             
             response.raise_for_status()
-            data = response.json()
             
-            # Process the scraped content
+            # Extract basic info from HTML
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Extract title
+            title = ""
+            if soup.title:
+                title = soup.title.string.strip() if soup.title.string else ""
+            
+            # Extract text content
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            text = soup.get_text()
+            # Clean up text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            # Don't truncate text - keep full content for case studies
+            # text = text[:2000]  # REMOVED - this was truncating important content
+            
             result = {
                 "url": url,
-                "title": data.get("title", ""),
-                "text": data.get("text", ""),
-                "links": data.get("links", []) if extract_links else [],
-                "success": data.get("success", False),
-                "status_code": data.get("status_code", 0)
+                "title": title,
+                "text": text,
+                "success": True,
+                "status_code": response.status_code,
+                "scraped_content": text  # Add this for backward compatibility
             }
             
-            logger.info(f"ScraperJS: Successfully scraped {len(result['text'])} characters from '{url}'")
+            logger.info(f"ScraperAPI: Successfully scraped {len(result['text'])} characters from '{url}' (Status: {response.status_code})")
+            logger.info(f"ScraperAPI: Response title: '{title}'")
             return result
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"ScraperJS API error: {str(e)}")
-            raise SearchError(f"ScraperJS API error: {str(e)}")
+            logger.error(f"ScraperAPI error: {str(e)}")
+            return {
+                "url": url,
+                "success": False,
+                "error": str(e),
+                "text": "",
+                "title": "",
+                "scraped_content": ""
+            }
         except Exception as e:
-            logger.error(f"ScraperJS error: {str(e)}")
-            raise SearchError(f"ScraperJS error: {str(e)}")
+            logger.error(f"ScraperAPI error: {str(e)}")
+            return {
+                "url": url,
+                "success": False,
+                "error": str(e),
+                "text": "",
+                "title": "",
+                "scraped_content": ""
+            }
     
-    async def batch_scrape(self, urls: List[str], extract_text: bool = True) -> List[Dict[str, Any]]:
+    async def batch_scrape(self, urls: List[str], render_js: bool = True) -> List[Dict[str, Any]]:
         """
-        Scrape multiple URLs in batch
+        Scrape multiple URLs in batch with optimized delays
         
         Args:
             urls: List of URLs to scrape
-            extract_text: Whether to extract text content
+            render_js: Whether to render JavaScript
         
         Returns:
             List of dictionaries containing scraped content
         """
         results = []
         
-        for url in urls:
+        # Limit URLs to reduce total time
+        urls_to_scrape = urls[:3]  # Only scrape first 3 URLs for speed
+        
+        for i, url in enumerate(urls_to_scrape):
             try:
-                result = await self.scrape_url(url, extract_text=extract_text)
+                result = await self.scrape_url(url, render_js=render_js)
                 results.append(result)
-                # Add delay to respect rate limits
-                time.sleep(1)
+                
+                # Reduced delay for faster processing
+                if i < len(urls_to_scrape) - 1:  # Don't delay after the last URL
+                    import asyncio
+                    await asyncio.sleep(0.5)  # Reduced from 2 seconds to 0.5 seconds
+                    
             except Exception as e:
                 logger.error(f"Failed to scrape {url}: {str(e)}")
                 results.append({
                     "url": url,
                     "success": False,
-                    "error": str(e)
+                    "error": str(e),
+                    "text": "",
+                    "title": "",
+                    "scraped_content": ""
                 })
         
         return results
@@ -276,6 +320,20 @@ class CaseStudyTool:
             "client story", "business case", "use case", "implementation story"
         ]
         
+        # Common company domains for faster case study reference
+        self.common_company_domains = {
+            'perplexity': 'perplexity.ai',
+            'zerotier': 'zerotier.com', 
+            'deepgram': 'deepgram.com',
+            'scale': 'scale.com',
+            'anthropic': 'anthropic.com',
+            'openai': 'openai.com',
+            'deepl': 'deepl.com',
+            'mistral': 'mistral.ai',
+            'cradlewise': 'cradlewise.com',
+            'photoroom': 'photoroom.com'
+        }
+        
     async def lookup_case_study(self, company_domain: str, context: str = "", rep_domain: str = "") -> Dict[str, Any]:
         """
         Look up case studies for a specific company domain
@@ -289,23 +347,13 @@ class CaseStudyTool:
             Dictionary containing case study results
         """
         try:
-            # Build search query filtering by rep domain to ensure we get our own case studies
-            site_filter = ""
-            if rep_domain:
-                # Filter to rep's domain and resources subdomain
-                site_filter = f'site:{rep_domain} OR site:resources.{rep_domain}'
+            # Extract company name from domain for better search
+            company_name = company_domain.replace('.com', '').replace('.org', '').replace('.net', '')
             
-            # Build search terms with prospect name as mandatory keyword
-            base_query = f'"{company_domain}"'
-            if context:
-                base_query += f' {context}'
+            # Build targeted search query based on context and guidelines
+            search_terms = self._generate_targeted_search_queries(company_name, context, rep_domain)
             
-            search_terms = [
-                f'{base_query} customer case study implementation results metrics {site_filter}',
-                f'{base_query} customer success story ROI revenue lift {site_filter}',
-                f'{base_query} client case study performance metrics results {site_filter}',
-                f'{base_query} implementation success testimonial {site_filter} filetype:pdf'
-            ]
+            logger.info(f"Generated search queries for {company_name}: {search_terms}")
             
             all_results = []
             
@@ -364,6 +412,185 @@ class CaseStudyTool:
                 "error": str(e)
             }
     
+    def _generate_targeted_search_queries(self, company_name: str, context: str = "", rep_domain: str = "") -> List[str]:
+        """
+        Generate intelligent, targeted search queries based on context and knowledge base guidelines.
+        
+        Args:
+            company_name: The company name (e.g., "nike")
+            context: Additional context (e.g., "automation", "marketing")
+            rep_domain: The rep's company domain (e.g., "bloomreach.com")
+            
+        Returns:
+            List of targeted search queries
+        """
+        # Build site filter to ensure we get case studies from the rep's company
+        site_filter = ""
+        if rep_domain:
+            # Check if rep_domain is in our common domains mapping
+            if rep_domain.lower() in self.common_company_domains:
+                site_filter = f'site:{self.common_company_domains[rep_domain.lower()]}'
+            else:
+                site_filter = f'site:{rep_domain}'
+        
+        # Determine search focus based on context
+        if context:
+            context_lower = context.lower()
+            
+            # Map context to specific search terms
+            context_mappings = {
+                'automation': ['automation', 'workflow', 'process optimization', 'efficiency'],
+                'marketing': ['marketing', 'personalization', 'campaign', 'customer engagement'],
+                'ecommerce': ['ecommerce', 'online retail', 'digital commerce', 'conversion'],
+                'analytics': ['analytics', 'data insights', 'reporting', 'business intelligence'],
+                'personalization': ['personalization', 'customer experience', 'segmentation', 'targeting'],
+                'growth': ['growth', 'revenue', 'expansion', 'scaling'],
+                'conversion': ['conversion', 'optimization', 'A/B testing', 'performance'],
+                'customer': ['customer success', 'retention', 'satisfaction', 'loyalty']
+            }
+            
+            # Find relevant keywords
+            relevant_keywords = []
+            for key, keywords in context_mappings.items():
+                if key in context_lower:
+                    relevant_keywords.extend(keywords)
+            
+            if not relevant_keywords:
+                relevant_keywords = [context]
+        else:
+            relevant_keywords = ['customer success', 'implementation', 'results']
+        
+        # Generate targeted search queries with emphasis on case study structure
+        queries = []
+        
+        # Primary query: Target actual case study URLs with path filtering
+        primary_context = relevant_keywords[0] if relevant_keywords else 'customer success'
+        queries.append(f'"{company_name}" "case study" {primary_context} {site_filter} -inurl:blog -inurl:news')
+        
+        # Secondary query: Look specifically in case study directories
+        queries.append(f'"{company_name}" {primary_context} {site_filter} inurl:case-studies OR inurl:customer-stories OR inurl:success-stories')
+        
+        # Tertiary query: PDF case studies with structure
+        queries.append(f'"{company_name}" "case study" filetype:pdf {primary_context} {site_filter}')
+        
+        # Quaternary query: Customer testimonials with results
+        queries.append(f'"{company_name}" customer testimonial results metrics {primary_context} {site_filter} -inurl:blog')
+        
+        return queries
+    
+    def parse_case_study_request(self, user_message: str) -> Dict[str, str]:
+        """
+        Parse natural language case study requests to extract company and context.
+        
+        Args:
+            user_message: User's natural language request
+            
+        Returns:
+            Dictionary with parsed company, context, and rep_domain
+        """
+        import re
+        
+        # Extract company mentions (looking for company names)
+        company_patterns = [
+            r'selling to (\w+)',
+            r'prospect (\w+)',
+            r'client (\w+)',
+            r'customer (\w+)',
+            r'company (\w+)',
+            r'at (\w+)'
+        ]
+        
+        company = None
+        for pattern in company_patterns:
+            match = re.search(pattern, user_message.lower())
+            if match:
+                company = match.group(1)
+                break
+        
+        # Extract rep company (where the sales rep works)
+        rep_patterns = [
+            r'sales rep at (\w+)',
+            r'work at (\w+)',
+            r'from (\w+)',
+            r'rep at (\w+)'
+        ]
+        
+        rep_company = None
+        for pattern in rep_patterns:
+            match = re.search(pattern, user_message.lower())
+            if match:
+                rep_company = match.group(1)
+                break
+        
+        # Extract context from common keywords
+        context_keywords = ['automation', 'marketing', 'ecommerce', 'analytics', 
+                          'personalization', 'growth', 'conversion', 'customer']
+        
+        context = None
+        for keyword in context_keywords:
+            if keyword in user_message.lower():
+                context = keyword
+                break
+        
+        return {
+            'company': company,
+            'rep_company': rep_company,
+            'context': context or 'customer success'
+        }
+    
+    def _validate_case_study_structure(self, content: str) -> Dict[str, Any]:
+        """
+        Validate that content has proper case study structure with challenge and solution sections.
+        
+        Args:
+            content: The page content to validate
+            
+        Returns:
+            Dictionary with validation results and scoring
+        """
+        content_lower = content.lower()
+        validation_result = {
+            'has_challenge': False,
+            'has_solution': False,
+            'has_results': False,
+            'structure_score': 0,
+            'sections_found': []
+        }
+        
+        # Check for Challenge/Problem section
+        challenge_keywords = ['challenge', 'problem', 'issue', 'obstacle', 'difficulty', 'pain point', 'before']
+        for keyword in challenge_keywords:
+            if keyword in content_lower:
+                validation_result['has_challenge'] = True
+                validation_result['sections_found'].append(keyword)
+                break
+        
+        # Check for Solution/Implementation section
+        solution_keywords = ['solution', 'implementation', 'approach', 'methodology', 'strategy', 'how we', 'our approach']
+        for keyword in solution_keywords:
+            if keyword in content_lower:
+                validation_result['has_solution'] = True
+                validation_result['sections_found'].append(keyword)
+                break
+        
+        # Check for Results/Outcomes section
+        results_keywords = ['results', 'outcomes', 'impact', 'achieved', 'improvement', 'success', 'roi', 'metrics', 'after']
+        for keyword in results_keywords:
+            if keyword in content_lower:
+                validation_result['has_results'] = True
+                validation_result['sections_found'].append(keyword)
+                break
+        
+        # Calculate structure score
+        if validation_result['has_challenge'] and validation_result['has_solution']:
+            validation_result['structure_score'] = 20  # Base score for having both challenge and solution
+            if validation_result['has_results']:
+                validation_result['structure_score'] += 10  # Bonus for having results
+        elif validation_result['has_challenge'] or validation_result['has_solution']:
+            validation_result['structure_score'] = 5  # Partial score for having one section
+        
+        return validation_result
+    
     def _rank_case_study_results(self, results: List[Dict[str, Any]], company_domain: str, rep_domain: str = "") -> List[Dict[str, Any]]:
         """Rank case study results by relevance with new scoring system"""
         scored_results = []
@@ -375,6 +602,14 @@ class CaseStudyTool:
             content = result.get('scraped_content', '').lower()
             url = result.get('url', '').lower()
             
+            # CASE STUDY STRUCTURE VALIDATION - NEW PRIORITY
+            full_text = f"{title} {description} {content}"
+            structure_validation = self._validate_case_study_structure(full_text)
+            score += structure_validation['structure_score']
+            
+            # Add structure validation to result for later reference
+            result['structure_validation'] = structure_validation
+            
             # NEW SCORING SYSTEM based on case_study_tool_changes.md
             
             # +2 points for same domain (rep's domain)
@@ -385,6 +620,14 @@ class CaseStudyTool:
             if 'filetype:pdf' in url or 'resources.' in url or '.pdf' in url:
                 score += 1
             
+            # +10 points for actual case study URLs
+            if any(path in url for path in ['/case-studies/', '/customer-stories/', '/success-stories/', '/customers/']):
+                score += 10
+            
+            # +5 points for case study in URL path
+            if 'case-study' in url or 'customer-story' in url or 'success-story' in url:
+                score += 5
+            
             # -3 points for "How [prospect] helped..." patterns (wrong ownership)
             if f'how {company_domain.lower()}' in title or f'how {company_domain.lower()}' in description:
                 score -= 3
@@ -392,6 +635,14 @@ class CaseStudyTool:
             # -2 points for listicles
             if any(word in title for word in ['top 10', 'best practices', 'tips', 'guide to', 'how to']):
                 score -= 2
+            
+            # -5 points for blog posts and news articles (NOT case studies)
+            if any(path in url for path in ['/blog/', '/news/', '/press/', '/articles/']):
+                score -= 5
+            
+            # -3 points for generic pages
+            if any(word in title.lower() for word in ['what is', 'why', 'introduction to', 'overview of']):
+                score -= 3
             
             # EXISTING SCORING (keep existing logic but with adjusted weights)
             
@@ -445,8 +696,20 @@ class CaseStudyTool:
                 'relevance_score': score
             })
         
-        # Filter out very low scoring results (likely generic articles)
-        filtered_results = [r for r in scored_results if r['relevance_score'] > 0]
+        # Filter out results that don't have proper case study structure
+        # Only keep results that have either challenge+solution OR high relevance score AND are not blog posts
+        filtered_results = []
+        for result in scored_results:
+            structure_val = result.get('structure_validation', {})
+            url = result.get('url', '').lower()
+            
+            # Skip blog posts, news articles, and generic pages entirely
+            if any(path in url for path in ['/blog/', '/news/', '/press/', '/articles/']):
+                continue
+            
+            # Keep results that have proper case study structure OR high relevance score
+            if (structure_val.get('has_challenge') and structure_val.get('has_solution')) or result['relevance_score'] > 15:
+                filtered_results.append(result)
         
         # Sort by score (descending) and remove duplicates
         filtered_results.sort(key=lambda x: x['relevance_score'], reverse=True)
@@ -468,6 +731,7 @@ class CaseStudyTool:
         description = result.get('description', '')
         content = result.get('scraped_content', '')
         url = result.get('url', '')
+        structure_validation = result.get('structure_validation', {})
         
         # Extract potential metrics
         metrics = []
@@ -491,7 +755,14 @@ class CaseStudyTool:
             "description": description[:500],  # Truncate for summary
             "key_metrics": metrics[:5],  # Top 5 metrics
             "content_preview": content[:1000] if content else description[:1000],
-            "relevance_score": result.get('relevance_score', 0)
+            "relevance_score": result.get('relevance_score', 0),
+            "structure_validation": {
+                "has_challenge": structure_validation.get('has_challenge', False),
+                "has_solution": structure_validation.get('has_solution', False),
+                "has_results": structure_validation.get('has_results', False),
+                "structure_score": structure_validation.get('structure_score', 0),
+                "sections_found": structure_validation.get('sections_found', [])
+            }
         }
     
     def save_as_markdown(self, case_study_data: Dict[str, Any], output_path: str = None) -> Dict[str, Any]:
@@ -633,6 +904,253 @@ class CaseStudyTool:
         
         return markdown
 
+class ApolloProcessingTool:
+    """
+    Tool for processing Apollo.io domain workflows
+    """
+    def __init__(self):
+        import sys
+        import os
+        
+        # Add project root to path for imports
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.append(project_root)
+        
+        self.output_dir = os.path.join(os.getcwd(), "data", "output")
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    async def process_domains_csv(self, csv_content: str, headless: bool = True, run_apify: bool = False) -> Dict[str, Any]:
+        """
+        Process a CSV file containing domains through the Apollo workflow
+        
+        Args:
+            csv_content: CSV content as string
+            headless: Whether to run browser in headless mode
+            run_apify: Whether to run Apify scraping after URL generation
+            
+        Returns:
+            Dictionary containing workflow results
+        """
+        try:
+            import tempfile
+            import csv
+            import io
+            import json
+            from datetime import datetime
+            
+            # Parse CSV content
+            csv_reader = csv.DictReader(io.StringIO(csv_content))
+            domains = []
+            
+            for row in csv_reader:
+                # Look for domain column (try various common column names)
+                domain_columns = ['domain', 'Domain', 'company_domain', 'website', 'url']
+                domain = None
+                
+                for col in domain_columns:
+                    if col in row and row[col]:
+                        domain = row[col].strip()
+                        # Clean up domain (remove http/https, www)
+                        domain = domain.replace('http://', '').replace('https://', '').replace('www.', '')
+                        if domain.endswith('/'):
+                            domain = domain[:-1]
+                        domains.append(domain)
+                        break
+                
+                if not domain:
+                    # If no standard column found, use the first non-empty value
+                    for value in row.values():
+                        if value and value.strip():
+                            domain = value.strip()
+                            domain = domain.replace('http://', '').replace('https://', '').replace('www.', '')
+                            if domain.endswith('/'):
+                                domain = domain[:-1]
+                            domains.append(domain)
+                            break
+            
+            if not domains:
+                return {
+                    "success": False,
+                    "error": "No domains found in CSV file",
+                    "domains_processed": 0
+                }
+            
+            # Create temporary CSV file for the workflow
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_csv_path = os.path.join(self.output_dir, f"domains_{timestamp}.csv")
+            
+            with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['domain'])
+                for domain in domains:
+                    writer.writerow([domain])
+            
+            # Run the Apollo workflow
+            result = await self._run_apollo_workflow(temp_csv_path, headless)
+            
+            # Add domain info to result
+            result["domains_processed"] = len(domains)
+            result["domains_list"] = domains
+            result["csv_path"] = temp_csv_path
+            
+            # Optional: Run Apify scraping if requested and workflow succeeded
+            if run_apify and result.get("success") and result.get("bulk_url"):
+                logger.info("🔄 Step 8: Running Apify scraper (optional)")
+                try:
+                    from automation.run_apify import create_apify_scraper
+                    
+                    apify_token = os.getenv("APIFY_TOKEN")
+                    if apify_token:
+                        scraper = create_apify_scraper(token=apify_token)
+                        
+                        # Use the actor ID specified in guidelines: "jljBwyyQakqrL1wae"
+                        scraper_result = scraper.run_scraper(
+                            url=result["bulk_url"],
+                            total_records=200,
+                            filename="Apollo Prospects",
+                            wait_for_completion=True
+                        )
+                        
+                        if scraper_result.get("success"):
+                            logger.info("✅ Apify scraping completed successfully")
+                            result["apify_result"] = scraper_result
+                            result["contacts_scraped"] = scraper_result.get("results_count", 0)
+                            
+                            # Save results to output/contacts.json as per guidelines
+                            output_path = os.path.join(self.output_dir, "contacts.json")
+                            with open(output_path, 'w', encoding='utf-8') as f:
+                                json.dump(scraper_result.get("results", []), f, indent=2)
+                            
+                            result["output_file"] = output_path
+                            logger.info(f"✅ Contact records saved to {output_path}")
+                        else:
+                            logger.warning(f"⚠️ Apify scraping failed: {scraper_result.get('error')}")
+                            result["apify_error"] = scraper_result.get("error")
+                    else:
+                        logger.warning("⚠️ APIFY_TOKEN not found, skipping Apify scraping")
+                        result["apify_error"] = "APIFY_TOKEN not configured"
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error running Apify scraper: {str(e)}")
+                    result["apify_error"] = str(e)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing domains CSV: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "domains_processed": 0
+            }
+    
+    async def _run_apollo_workflow(self, csv_path: str, headless: bool = True) -> Dict[str, Any]:
+        """
+        Run the Apollo workflow with the given CSV file following claude_day_2_guidelines.md
+        
+        Args:
+            csv_path: Path to the CSV file
+            headless: Whether to run browser in headless mode
+            
+        Returns:
+            Dictionary containing workflow results
+        """
+        try:
+            logger.info("🔄 Starting Apollo workflow - Step 1: Load domains")
+            
+            # Step 1: Load domains using pandas (as per guidelines)
+            from data.load_domains import load_domains
+            from config.job_titles import get_priority_titles
+            from automation.browser_setup import create_apollo_controller
+            from utils.url_utils import extract_search_id, build_bulk_url
+            
+            # Load domains - must return newline-separated string (per guidelines)
+            domains_str = load_domains(csv_path)
+            domains_list = domains_str.split('\n')
+            logger.info(f"✅ Loaded {len(domains_list)} domains from CSV")
+            
+            # Step 2: Browser automation setup using browser_use Controller
+            logger.info("🔄 Step 2: Initialize browser automation controller")
+            controller = create_apollo_controller(
+                cookies_file="cookies/apollo.json",
+                headless=headless
+            )
+            
+            await controller.initialize()
+            logger.info("✅ Browser controller initialized")
+            
+            # Step 3: Navigate to Apollo.io
+            logger.info("🔄 Step 3: Navigate to Apollo.io")
+            nav_result = await controller.navigate_to_apollo()
+            if not nav_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Failed to navigate to Apollo: {nav_result['error']}"
+                }
+            logger.info("✅ Successfully navigated to Apollo.io")
+            
+            # Step 4: Load and paste domains (using @controller.action pattern)
+            logger.info("🔄 Step 4: Load and paste domains into Apollo")
+            domains_result = await controller.load_and_paste_domains(domains_str)
+            if not domains_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Failed to load domains: {domains_result['error']}"
+                }
+            logger.info("✅ Successfully pasted domains into Apollo")
+            
+            # Step 5: Save search (must double-click and wait 15 seconds per guidelines)
+            logger.info("🔄 Step 5: Save search and extract URL (waiting 15 seconds)")
+            save_result = await controller.save_and_extract_url()
+            if not save_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Failed to save search: {save_result['error']}"
+                }
+            logger.info("✅ Successfully saved search and extracted URL")
+            
+            # Step 6: Extract search ID from fragment (not query string per guidelines)
+            logger.info("🔄 Step 6: Extract qOrganizationSearchListId from URL fragment")
+            search_url = save_result["url"]
+            search_id = extract_search_id(search_url)
+            
+            if not search_id:
+                return {
+                    "success": False,
+                    "error": "Failed to extract qOrganizationSearchListId from URL fragment"
+                }
+            logger.info(f"✅ Successfully extracted search ID: {search_id}")
+            
+            # Step 7: Build bulk URL with URL-encoded job titles
+            logger.info("🔄 Step 7: Construct final URL for scraping with job titles")
+            job_titles = get_priority_titles()[:5]  # Use top 5 titles
+            bulk_url = build_bulk_url(search_id, job_titles)
+            logger.info(f"✅ Successfully built bulk URL with {len(job_titles)} job titles")
+            
+            # Step 8: Cleanup
+            await controller.close()
+            logger.info("✅ Browser controller closed")
+            
+            # Final status
+            logger.info("🎯 Apollo workflow completed successfully!")
+            
+            return {
+                "success": True,
+                "search_id": search_id,
+                "search_url": search_url,
+                "bulk_url": bulk_url,
+                "job_titles": job_titles,
+                "domains_count": len(domains_list),
+                "message": f"Successfully processed {len(domains_list)} domains and created Apollo search with ID: {search_id}"
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error running Apollo workflow: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
 class WebSearchManager:
     """
     Manager class that combines Brave Search and ScraperJS for comprehensive web search
@@ -645,13 +1163,16 @@ class WebSearchManager:
             self.brave_search = None
         
         try:
-            self.scraperjs = ScraperJSTool()
+            self.scraperapi = ScraperAPITool()
         except SearchError as e:
-            logger.warning(f"ScraperJS not available: {str(e)}")
-            self.scraperjs = None
+            logger.warning(f"ScraperAPI not available: {str(e)}")
+            self.scraperapi = None
         
         # Initialize case study tool
         self.case_study_tool = CaseStudyTool(self)
+        
+        # Initialize Apollo processing tool
+        self.apollo_tool = ApolloProcessingTool()
     
     async def search_and_scrape(self, query: str, count: int = 5, scrape_top_results: int = 3) -> Dict[str, Any]:
         """
@@ -665,17 +1186,39 @@ class WebSearchManager:
         Returns:
             Dictionary containing search results and scraped content
         """
+        logger.info(f"DEBUG: search_and_scrape called with query='{query}', count={count}, scrape_top_results={scrape_top_results}")
+        
         if not self.brave_search:
             raise SearchError("Brave Search is not available")
         
         # Perform the search
+        logger.info(f"DEBUG: Performing Brave search...")
         search_results = await self.brave_search.search(query, count=count)
+        logger.info(f"DEBUG: Brave search returned {len(search_results.get('results', []))} results")
         
-        # Scrape top results if ScraperJS is available
+        # Scrape top results if ScraperAPI is available
         scraped_content = []
-        if self.scraperjs and scrape_top_results > 0:
+        if self.scraperapi and scrape_top_results > 0:
+            logger.info(f"DEBUG: ScraperAPI available, scraping top {scrape_top_results} results")
             top_urls = [result["url"] for result in search_results["results"][:scrape_top_results]]
-            scraped_content = await self.scraperjs.batch_scrape(top_urls)
+            logger.info(f"DEBUG: URLs to scrape: {top_urls}")
+            
+            scraped_content = await self.scraperapi.batch_scrape(top_urls)
+            logger.info(f"DEBUG: Scraped {len(scraped_content)} URLs")
+            
+            # Merge scraped content back into search results
+            for i, scraped in enumerate(scraped_content):
+                if i < len(search_results["results"]) and scraped.get("success"):
+                    search_results["results"][i]["scraped_content"] = scraped.get("text", "")
+                    search_results["results"][i]["scraped_title"] = scraped.get("title", "")
+                    search_results["results"][i]["scraping_success"] = True
+                    logger.info(f"DEBUG: Successfully merged scraped content for result {i+1}")
+                elif i < len(search_results["results"]):
+                    search_results["results"][i]["scraping_success"] = False
+                    search_results["results"][i]["scraping_error"] = scraped.get("error", "Unknown error")
+                    logger.info(f"DEBUG: Failed to scrape result {i+1}: {scraped.get('error', 'Unknown error')}")
+        else:
+            logger.info(f"DEBUG: ScraperAPI not available or scrape_top_results=0")
         
         # Combine search results with scraped content
         enhanced_results = []
