@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -117,6 +117,7 @@ class SearchResponse(BaseModel):
 class CaseStudyRequest(BaseModel):
     company_domain: str
     context: str = ""
+    rep_domain: str = ""
 
 
 class CaseStudyResponse(BaseModel):
@@ -126,6 +127,23 @@ class CaseStudyResponse(BaseModel):
     all_results: Optional[List[Dict[str, Any]]] = None
     total_found: Optional[int] = None
     saved_path: Optional[str] = None
+    report_id: Optional[str] = None  # For PDF download
+    error: Optional[Dict[str, Any]] = None
+
+
+class ReportGenerateRequest(BaseModel):
+    company_domain: str
+    context: str = ""
+    rep_domain: str = ""
+    format_type: str = "pdf"  # "pdf", "html", or "both"
+
+
+class ReportGenerateResponse(BaseModel):
+    ok: bool
+    report_id: Optional[str] = None
+    download_url: Optional[str] = None
+    generated_files: Optional[List[Dict[str, Any]]] = None
+    ai_design: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
 
 
@@ -518,9 +536,9 @@ async def case_study_endpoint(request: CaseStudyRequest):
             {"company_domain": request.company_domain, "context": request.context},
         )
 
-        # Perform case study lookup
+        # Perform case study lookup with rep_domain
         result = await web_search_manager.case_study_tool.lookup_case_study(
-            request.company_domain, request.context
+            request.company_domain, request.context, request.rep_domain
         )
 
         if result["ok"]:
@@ -569,6 +587,149 @@ async def case_study_endpoint(request: CaseStudyRequest):
             company_domain=request.company_domain,
             error={"type": "internal_error", "message": str(e)},
         )
+
+
+# Store generated reports for download
+report_cache = {}
+
+@app.post("/case-study/generate-report", response_model=ReportGenerateResponse)
+async def generate_case_study_report(request: ReportGenerateRequest):
+    """Generate AI-designed case study report with download capability"""
+    try:
+        logger.info(f"Generating report for: {request.company_domain}")
+        
+        # First get case study data
+        case_study_result = await web_search_manager.case_study_tool.lookup_case_study(
+            request.company_domain, request.context, request.rep_domain
+        )
+        
+        if not case_study_result["ok"]:
+            return ReportGenerateResponse(
+                ok=False,
+                error={"type": "case_study_error", "message": case_study_result["error"]}
+            )
+        
+        # Generate AI-designed report
+        report_result = await web_search_manager.case_study_tool.generate_client_report(
+            case_study_result, request.format_type
+        )
+        
+        if report_result["success"]:
+            # Generate unique report ID
+            import uuid
+            report_id = str(uuid.uuid4())
+            
+            # Store report info for download
+            report_cache[report_id] = {
+                "company": request.company_domain,
+                "generated_files": report_result["generated_files"],
+                "ai_design": report_result.get("ai_design", {}),
+                "timestamp": report_result["timestamp"]
+            }
+            
+            # Find PDF file for download URL
+            pdf_file = None
+            for file_info in report_result["generated_files"]:
+                if file_info["type"] == "pdf":
+                    pdf_file = file_info["path"]
+                    break
+            
+            download_url = f"/case-study/download-report/{report_id}" if pdf_file else None
+            
+            logger.info(f"✅ Report generated successfully with ID: {report_id}")
+            
+            return ReportGenerateResponse(
+                ok=True,
+                report_id=report_id,
+                download_url=download_url,
+                generated_files=report_result["generated_files"],
+                ai_design=report_result.get("ai_design", {})
+            )
+        else:
+            return ReportGenerateResponse(
+                ok=False,
+                error={"type": "report_generation_error", "message": report_result["error"]}
+            )
+            
+    except Exception as e:
+        logger.error(f"Report generation error: {str(e)}")
+        return ReportGenerateResponse(
+            ok=False,
+            error={"type": "internal_error", "message": str(e)}
+        )
+
+
+@app.get("/case-study/download-report/{report_id}")
+async def download_case_study_report(report_id: str):
+    """Download generated case study report as PDF"""
+    try:
+        if report_id not in report_cache:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        report_info = report_cache[report_id]
+        
+        # Find the PDF file
+        pdf_file = None
+        for file_info in report_info["generated_files"]:
+            if file_info["type"] == "pdf":
+                pdf_file = file_info["path"]
+                break
+        
+        if not pdf_file or not os.path.exists(pdf_file):
+            raise HTTPException(status_code=404, detail="PDF file not found")
+        
+        # Generate download filename
+        company = report_info["company"]
+        timestamp = report_info["timestamp"]
+        download_filename = f"case_study_report_{company}_{timestamp}.pdf"
+        
+        logger.info(f"📥 Downloading report: {download_filename}")
+        
+        return FileResponse(
+            path=pdf_file,
+            filename=download_filename,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={download_filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/case-study/view-report/{report_id}")
+async def view_case_study_report(report_id: str):
+    """View generated case study report as HTML"""
+    try:
+        if report_id not in report_cache:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        report_info = report_cache[report_id]
+        
+        # Find the HTML file
+        html_file = None
+        for file_info in report_info["generated_files"]:
+            if file_info["type"] == "html":
+                html_file = file_info["path"]
+                break
+        
+        if not html_file or not os.path.exists(html_file):
+            raise HTTPException(status_code=404, detail="HTML file not found")
+        
+        logger.info(f"👁️ Viewing report: {report_id}")
+        
+        return FileResponse(
+            path=html_file,
+            media_type="text/html"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"View error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def run_single_turn_chat(

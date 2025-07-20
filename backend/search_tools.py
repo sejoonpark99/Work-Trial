@@ -493,34 +493,14 @@ class BraveSearchTool:
 
 class CaseStudyTool:
     """
-    Case study lookup tool that builds on web search for domain-scoped case studies
+    Simplified case study lookup tool using site: filtering and content analysis
     """
     def __init__(self, web_search_manager):
         self.web_search_manager = web_search_manager
-        self.case_study_keywords = [
-            "case study", "customer story", "success story", "implementation",
-            "results", "ROI", "transformation", "deployment", "metrics",
-            "performance", "growth", "improvement", "testimonial", "customer success",
-            "client story", "business case", "use case", "implementation story"
-        ]
-        
-        # Common company domains for faster case study reference
-        self.common_company_domains = {
-            'perplexity': 'perplexity.ai',
-            'zerotier': 'zerotier.com', 
-            'deepgram': 'deepgram.com',
-            'scale': 'scale.com',
-            'anthropic': 'anthropic.com',
-            'openai': 'openai.com',
-            'deepl': 'deepl.com',
-            'mistral': 'mistral.ai',
-            'cradlewise': 'cradlewise.com',
-            'photoroom': 'photoroom.com'
-        }
         
     async def lookup_case_study(self, company_domain: str, context: str = "", rep_domain: str = "") -> Dict[str, Any]:
         """
-        Look up case studies for a specific company domain
+        Look up case studies for a specific company using simple site: filtering and content analysis
         
         Args:
             company_domain: Domain or company name to search for (prospect)
@@ -531,61 +511,57 @@ class CaseStudyTool:
             Dictionary containing case study results
         """
         try:
-            # Extract company name from domain for better search
+            # Input validation
+            if not company_domain:
+                return {"ok": False, "error": "Company domain is required"}
+            
+            if not rep_domain:
+                return {"ok": False, "error": "Rep domain is required for site: filtering"}
+            
+            # Extract company name from domain
             company_name = company_domain.replace('.com', '').replace('.org', '').replace('.net', '')
             
-            # Build targeted search query based on context and guidelines
-            search_terms = self._generate_targeted_search_queries(company_name, context, rep_domain)
+            # Generate smart search query using LLM
+            search_query = await self._generate_smart_search_query(company_name, rep_domain, context)
             
-            logger.info(f"Generated search queries for {company_name}: {search_terms}")
+            logger.info(f"Searching for case studies: {search_query}")
             
-            all_results = []
+            # Use OpenAI WebSearch tool to search and read content
+            search_results = await self.web_search_manager.openai_websearch.search(
+                search_query, 
+                count=5,  # Fewer, higher quality results
+                read_content=True
+            )
             
-            # Search with just the first term to avoid rate limits
-            search_term = search_terms[0]  # Only use the first, most relevant term
-            try:
-                # Add delay to avoid rate limiting
-                await asyncio.sleep(1)
-                
-                # Use basic search without scraping to avoid rate limits
-                results = await self.web_search_manager.brave_search.search(
-                    search_term, 
-                    count=8  # Get more results in a single request
-                )
-                all_results.extend(results['results'])
-                logger.info(f"Successfully searched for '{search_term}', found {len(results['results'])} results")
-            except Exception as e:
-                logger.error(f"Error searching for '{search_term}': {str(e)}")
-                # Return error info for debugging
+            if not search_results.get("results"):
                 return {
                     "ok": False,
                     "company_domain": company_domain,
-                    "error": f"Search failed: {str(e)}"
+                    "error": "No search results found"
                 }
             
-            # Rank and filter results with new scoring system
-            ranked_results = self._rank_case_study_results(all_results, company_domain, rep_domain)
+            # Analyze results using OpenAI content analysis
+            analyzed_results = await self._analyze_case_studies_with_ai(
+                search_results["results"], 
+                company_name,
+                context
+            )
             
-            # Get top result for detailed analysis
-            top_result = ranked_results[0] if ranked_results else None
-            
-            if top_result:
-                # Extract key information from the top result
-                summary = self._extract_case_study_summary(top_result)
-                
+            if analyzed_results:
                 return {
                     "ok": True,
                     "company_domain": company_domain,
-                    "top_result": top_result,
-                    "summary": summary,
-                    "all_results": ranked_results[:5],  # Return top 5
-                    "total_found": len(ranked_results)
+                    "search_query": search_query,
+                    "method": "simplified_site_filtering",
+                    "top_result": analyzed_results[0],
+                    "all_results": analyzed_results,
+                    "total_found": len(analyzed_results)
                 }
             else:
                 return {
                     "ok": False,
                     "company_domain": company_domain,
-                    "error": "No case studies found for this domain"
+                    "error": "No relevant case studies found after content analysis"
                 }
                 
         except Exception as e:
@@ -596,497 +572,1250 @@ class CaseStudyTool:
                 "error": str(e)
             }
     
-    def _generate_targeted_search_queries(self, company_name: str, context: str = "", rep_domain: str = "") -> List[str]:
+    async def _analyze_case_studies_with_ai(self, search_results: List[Dict], company_name: str, context: str = "") -> List[Dict]:
         """
-        Generate intelligent, targeted search queries based on context and knowledge base guidelines.
+        Use OpenAI to analyze search results and identify real case studies
         
         Args:
-            company_name: The company name (e.g., "nike")
-            context: Additional context (e.g., "automation", "marketing")
-            rep_domain: The rep's company domain (e.g., "bloomreach.com")
+            search_results: List of search results with content
+            company_name: Name of the company to look for
+            context: Additional context for analysis
             
         Returns:
-            List of targeted search queries
+            List of verified case studies ranked by relevance
         """
-        # Build site filter to ensure we get case studies from the rep's company
-        site_filter = ""
-        if rep_domain:
-            # Check if rep_domain is in our common domains mapping
-            if rep_domain.lower() in self.common_company_domains:
-                site_filter = f'site:{self.common_company_domains[rep_domain.lower()]}'
-            else:
-                site_filter = f'site:{rep_domain}'
-        
-        # Determine search focus based on context
-        if context:
-            context_lower = context.lower()
+        try:
+            verified_case_studies = []
             
-            # Map context to specific search terms
-            context_mappings = {
-                'automation': ['automation', 'workflow', 'process optimization', 'efficiency'],
-                'marketing': ['marketing', 'personalization', 'campaign', 'customer engagement'],
-                'ecommerce': ['ecommerce', 'online retail', 'digital commerce', 'conversion'],
-                'analytics': ['analytics', 'data insights', 'reporting', 'business intelligence'],
-                'personalization': ['personalization', 'customer experience', 'segmentation', 'targeting'],
-                'growth': ['growth', 'revenue', 'expansion', 'scaling'],
-                'conversion': ['conversion', 'optimization', 'A/B testing', 'performance'],
-                'customer': ['customer success', 'retention', 'satisfaction', 'loyalty']
-            }
+            for result in search_results:
+                # Skip if no content was read
+                if not result.get("content_read") or not result.get("content"):
+                    continue
+                
+                # Use OpenAI to analyze if this is a real case study about the company
+                is_case_study = await self._verify_case_study_with_ai(
+                    result.get("content", ""),
+                    result.get("title", ""),
+                    company_name,
+                    context
+                )
+                
+                if is_case_study["is_case_study"]:
+                    result.update({
+                        "ai_analysis": is_case_study,
+                        "relevance_score": is_case_study.get("relevance_score", 0),
+                        "case_study_type": is_case_study.get("case_study_type", "unknown"),
+                        "key_insights": is_case_study.get("key_insights", [])
+                    })
+                    verified_case_studies.append(result)
             
-            # Find relevant keywords
-            relevant_keywords = []
-            for key, keywords in context_mappings.items():
-                if key in context_lower:
-                    relevant_keywords.extend(keywords)
+            # Sort by relevance score (highest first)
+            verified_case_studies.sort(
+                key=lambda x: x.get("relevance_score", 0), 
+                reverse=True
+            )
             
-            if not relevant_keywords:
-                relevant_keywords = [context]
-        else:
-            relevant_keywords = ['customer success', 'implementation', 'results']
-        
-        # Generate targeted search queries with emphasis on case study structure
-        queries = []
-        
-        # Primary query: Target actual case study URLs with path filtering
-        primary_context = relevant_keywords[0] if relevant_keywords else 'customer success'
-        queries.append(f'"{company_name}" "case study" {primary_context} {site_filter} -inurl:blog -inurl:news')
-        
-        # Secondary query: Look specifically in case study directories
-        queries.append(f'"{company_name}" {primary_context} {site_filter} inurl:case-studies OR inurl:customer-stories OR inurl:success-stories')
-        
-        # Tertiary query: PDF case studies with structure
-        queries.append(f'"{company_name}" "case study" filetype:pdf {primary_context} {site_filter}')
-        
-        # Quaternary query: Customer testimonials with results
-        queries.append(f'"{company_name}" customer testimonial results metrics {primary_context} {site_filter} -inurl:blog')
-        
-        return queries
+            return verified_case_studies
+            
+        except Exception as e:
+            logger.error(f"Error analyzing case studies with AI: {str(e)}")
+            return []
     
-    def parse_case_study_request(self, user_message: str) -> Dict[str, str]:
+    async def _verify_case_study_with_ai(self, content: str, title: str, company_name: str, context: str = "") -> Dict:
         """
-        Parse natural language case study requests to extract company and context.
+        Use OpenAI to verify if content is actually a case study about the specified company
+        """
+        try:
+            # Use the OpenAI API from the web search tool
+            openai_tool = self.web_search_manager.openai_websearch
+            if not openai_tool.openai_api_key:
+                return {"is_case_study": False, "error": "OpenAI API key not available"}
+            
+            import openai
+            openai.api_key = openai_tool.openai_api_key
+            
+            prompt = f"""
+            Analyze this content to determine if it's a case study about "{company_name}".
+            
+            Title: {title}
+            Content: {content[:2000]}...
+            Context: {context}
+            
+            Please respond with a JSON object containing:
+            {{
+                "is_case_study": true/false,
+                "relevance_score": 0-100,
+                "case_study_type": "customer_success" | "implementation" | "testimonial" | "other",
+                "key_insights": ["insight1", "insight2", ...],
+                "reasoning": "brief explanation"
+            }}
+            
+            A case study should:
+            1. Feature {company_name} as a customer/client (not as the vendor)
+            2. Describe challenges, solutions, and results
+            3. Include specific outcomes or metrics
+            4. Tell a story of implementation or success
+            """
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing business content to identify case studies. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.1
+            )
+            
+            # Parse JSON response
+            import json
+            analysis = json.loads(response.choices[0].message.content.strip())
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error verifying case study with AI: {str(e)}")
+            return {"is_case_study": False, "error": str(e)}
+    
+    async def _generate_smart_search_query(self, company_name: str, rep_domain: str, context: str = "") -> str:
+        """
+        Use OpenAI to generate a smart search query based on the company and context
         
         Args:
-            user_message: User's natural language request
+            company_name: Name of the prospect company (e.g., "Nike")
+            rep_domain: Sales rep's company domain (e.g., "bloomreach.com")
+            context: Additional context about the industry or use case
             
         Returns:
-            Dictionary with parsed company, context, and rep_domain
+            Optimized search query string
         """
-        import re
-        
-        # Extract company mentions (looking for company names)
-        company_patterns = [
-            r'selling to (\w+)',
-            r'prospect (\w+)',
-            r'client (\w+)',
-            r'customer (\w+)',
-            r'company (\w+)',
-            r'at (\w+)'
-        ]
-        
-        company = None
-        for pattern in company_patterns:
-            match = re.search(pattern, user_message.lower())
-            if match:
-                company = match.group(1)
-                break
-        
-        # Extract rep company (where the sales rep works)
-        rep_patterns = [
-            r'sales rep at (\w+)',
-            r'work at (\w+)',
-            r'from (\w+)',
-            r'rep at (\w+)'
-        ]
-        
-        rep_company = None
-        for pattern in rep_patterns:
-            match = re.search(pattern, user_message.lower())
-            if match:
-                rep_company = match.group(1)
-                break
-        
-        # Extract context from common keywords
-        context_keywords = ['automation', 'marketing', 'ecommerce', 'analytics', 
-                          'personalization', 'growth', 'conversion', 'customer']
-        
-        context = None
-        for keyword in context_keywords:
-            if keyword in user_message.lower():
-                context = keyword
-                break
-        
-        return {
-            'company': company,
-            'rep_company': rep_company,
-            'context': context or 'customer success'
-        }
+        try:
+            # Use the OpenAI API from the web search tool
+            openai_tool = self.web_search_manager.openai_websearch
+            if not openai_tool.openai_api_key:
+                # Fallback to simple query if no OpenAI API key
+                return f'"{company_name}" case study site:{rep_domain}'
+            
+            import openai
+            openai.api_key = openai_tool.openai_api_key
+            
+            prompt = f"""
+            Generate an optimized search query to find case studies about {company_name} on the {rep_domain} website.
+            
+            Company: {company_name}
+            Rep Domain: {rep_domain}
+            Context: {context if context else "No specific context provided"}
+            
+            Based on the company name, infer what industry they're in and what business challenges they might face.
+            Generate a search query that would find relevant case studies using these guidelines:
+            
+            1. Include relevant industry keywords (e.g., "ecommerce", "retail", "healthcare", "fintech")
+            2. Include relevant use case keywords (e.g., "personalization", "automation", "analytics")
+            3. Must end with "case study site:{rep_domain}"
+            4. Keep it concise (under 10 words total)
+            5. Don't include the company name in quotes
+            
+            Examples:
+            - For Nike: "ecommerce personalization case study site:bloomreach.com"
+            - For Tesla: "automotive customer experience case study site:salesforce.com"
+            - For Airbnb: "marketplace optimization case study site:segment.com"
+            
+            Return only the search query, nothing else.
+            """
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert at generating effective search queries for finding business case studies. Always respond with just the search query, no additional text."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=50,
+                temperature=0.3
+            )
+            
+            generated_query = response.choices[0].message.content.strip()
+            
+            # Validate the generated query has the required site: filter
+            if f"site:{rep_domain}" not in generated_query:
+                generated_query += f" site:{rep_domain}"
+            
+            logger.info(f"Generated smart search query: {generated_query}")
+            return generated_query
+            
+        except Exception as e:
+            logger.error(f"Error generating smart search query: {str(e)}")
+            # Fallback to simple query
+            return f'"{company_name}" case study site:{rep_domain}'
     
-    def _validate_case_study_structure(self, content: str) -> Dict[str, Any]:
+    async def generate_client_report(self, case_study_data: Dict[str, Any], format_type: str = "pdf") -> Dict[str, Any]:
         """
-        Validate that content has proper case study structure with challenge and solution sections.
-        
-        Args:
-            content: The page content to validate
-            
-        Returns:
-            Dictionary with validation results and scoring
-        """
-        content_lower = content.lower()
-        validation_result = {
-            'has_challenge': False,
-            'has_solution': False,
-            'has_results': False,
-            'structure_score': 0,
-            'sections_found': []
-        }
-        
-        # Check for Challenge/Problem section
-        challenge_keywords = ['challenge', 'problem', 'issue', 'obstacle', 'difficulty', 'pain point', 'before']
-        for keyword in challenge_keywords:
-            if keyword in content_lower:
-                validation_result['has_challenge'] = True
-                validation_result['sections_found'].append(keyword)
-                break
-        
-        # Check for Solution/Implementation section
-        solution_keywords = ['solution', 'implementation', 'approach', 'methodology', 'strategy', 'how we', 'our approach']
-        for keyword in solution_keywords:
-            if keyword in content_lower:
-                validation_result['has_solution'] = True
-                validation_result['sections_found'].append(keyword)
-                break
-        
-        # Check for Results/Outcomes section
-        results_keywords = ['results', 'outcomes', 'impact', 'achieved', 'improvement', 'success', 'roi', 'metrics', 'after']
-        for keyword in results_keywords:
-            if keyword in content_lower:
-                validation_result['has_results'] = True
-                validation_result['sections_found'].append(keyword)
-                break
-        
-        # Calculate structure score
-        if validation_result['has_challenge'] and validation_result['has_solution']:
-            validation_result['structure_score'] = 20  # Base score for having both challenge and solution
-            if validation_result['has_results']:
-                validation_result['structure_score'] += 10  # Bonus for having results
-        elif validation_result['has_challenge'] or validation_result['has_solution']:
-            validation_result['structure_score'] = 5  # Partial score for having one section
-        
-        return validation_result
-    
-    def _rank_case_study_results(self, results: List[Dict[str, Any]], company_domain: str, rep_domain: str = "") -> List[Dict[str, Any]]:
-        """Rank case study results by relevance with new scoring system"""
-        scored_results = []
-        
-        for result in results:
-            score = 0
-            title = result.get('title', '').lower()
-            description = result.get('description', '').lower()
-            content = result.get('scraped_content', '').lower()
-            url = result.get('url', '').lower()
-            
-            # CASE STUDY STRUCTURE VALIDATION - NEW PRIORITY
-            full_text = f"{title} {description} {content}"
-            structure_validation = self._validate_case_study_structure(full_text)
-            score += structure_validation['structure_score']
-            
-            # Add structure validation to result for later reference
-            result['structure_validation'] = structure_validation
-            
-            # NEW SCORING SYSTEM based on case_study_tool_changes.md
-            
-            # +2 points for same domain (rep's domain)
-            if rep_domain and rep_domain.lower() in url:
-                score += 2
-            
-            # +1 point for PDF or resources subdomain
-            if 'filetype:pdf' in url or 'resources.' in url or '.pdf' in url:
-                score += 1
-            
-            # +10 points for actual case study URLs
-            if any(path in url for path in ['/case-studies/', '/customer-stories/', '/success-stories/', '/customers/']):
-                score += 10
-            
-            # +5 points for case study in URL path
-            if 'case-study' in url or 'customer-story' in url or 'success-story' in url:
-                score += 5
-            
-            # -3 points for "How [prospect] helped..." patterns (wrong ownership)
-            if f'how {company_domain.lower()}' in title or f'how {company_domain.lower()}' in description:
-                score -= 3
-            
-            # -2 points for listicles
-            if any(word in title for word in ['top 10', 'best practices', 'tips', 'guide to', 'how to']):
-                score -= 2
-            
-            # -5 points for blog posts and news articles (NOT case studies)
-            if any(path in url for path in ['/blog/', '/news/', '/press/', '/articles/']):
-                score -= 5
-            
-            # -3 points for generic pages
-            if any(word in title.lower() for word in ['what is', 'why', 'introduction to', 'overview of']):
-                score -= 3
-            
-            # EXISTING SCORING (keep existing logic but with adjusted weights)
-            
-            # Domain relevance - prospect name as mandatory
-            if company_domain.lower() in title:
-                score += 10
-            if company_domain.lower() in description:
-                score += 5
-            if company_domain.lower() in content:
-                score += 3
-            
-            # Case study keywords
-            for keyword in self.case_study_keywords:
-                if keyword in title:
-                    score += 8
-                if keyword in description:
-                    score += 4
-                if keyword in content:
-                    score += 2
-            
-            # Boost actual implementation and specific company results
-            implementation_keywords = ['implementation', 'deployed', 'launched', 'achieved', 'increased', 'improved', 'reduced', 'saved']
-            for keyword in implementation_keywords:
-                if keyword in title:
-                    score += 8
-                if keyword in description:
-                    score += 5
-            
-            # Metrics and results keywords
-            metrics_keywords = ['roi', 'results', 'metrics', 'performance', 'growth', 'increase', 'improvement', '%', 'percent', 'x increase']
-            for keyword in metrics_keywords:
-                if keyword in title:
-                    score += 6
-                if keyword in description:
-                    score += 3
-                if keyword in content:
-                    score += 1
-            
-            # Boost specific company mentions (not generic)
-            company_indicators = ['customer', 'client', 'company', 'business', 'organization']
-            for indicator in company_indicators:
-                if f'{indicator} story' in title.lower() or f'{indicator} case' in title.lower():
-                    score += 10
-            
-            # Recency boost (if we can detect dates)
-            if '2024' in title or '2023' in title:
-                score += 3
-            
-            scored_results.append({
-                **result,
-                'relevance_score': score
-            })
-        
-        # Filter out results that don't have proper case study structure
-        # Only keep results that have either challenge+solution OR high relevance score AND are not blog posts
-        filtered_results = []
-        for result in scored_results:
-            structure_val = result.get('structure_validation', {})
-            url = result.get('url', '').lower()
-            
-            # Skip blog posts, news articles, and generic pages entirely
-            if any(path in url for path in ['/blog/', '/news/', '/press/', '/articles/']):
-                continue
-            
-            # Keep results that have proper case study structure OR high relevance score
-            if (structure_val.get('has_challenge') and structure_val.get('has_solution')) or result['relevance_score'] > 15:
-                filtered_results.append(result)
-        
-        # Sort by score (descending) and remove duplicates
-        filtered_results.sort(key=lambda x: x['relevance_score'], reverse=True)
-        
-        # Remove duplicates based on URL
-        seen_urls = set()
-        unique_results = []
-        for result in filtered_results:
-            url = result.get('url', '')
-            if url not in seen_urls:
-                seen_urls.add(url)
-                unique_results.append(result)
-        
-        return unique_results
-    
-    def _extract_case_study_summary(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract key information from a case study result"""
-        title = result.get('title', '')
-        description = result.get('description', '')
-        content = result.get('scraped_content', '')
-        url = result.get('url', '')
-        structure_validation = result.get('structure_validation', {})
-        
-        # Extract potential metrics
-        metrics = []
-        metric_patterns = [
-            r'(\d+%?\s*(?:increase|improvement|growth|boost|rise))',
-            r'(\d+%?\s*(?:decrease|reduction|drop|decline))',
-            r'(\d+x\s*(?:faster|quicker|more|better))',
-            r'(\$\d+[kmb]?\s*(?:saved|revenue|profit|cost))',
-            r'(\d+%?\s*ROI)',
-        ]
-        
-        full_text = f"{title} {description} {content}".lower()
-        for pattern in metric_patterns:
-            import re
-            matches = re.findall(pattern, full_text, re.IGNORECASE)
-            metrics.extend(matches)
-        
-        return {
-            "title": title,
-            "url": url,
-            "description": description[:500],  # Truncate for summary
-            "key_metrics": metrics[:5],  # Top 5 metrics
-            "content_preview": content[:1000] if content else description[:1000],
-            "relevance_score": result.get('relevance_score', 0),
-            "structure_validation": {
-                "has_challenge": structure_validation.get('has_challenge', False),
-                "has_solution": structure_validation.get('has_solution', False),
-                "has_results": structure_validation.get('has_results', False),
-                "structure_score": structure_validation.get('structure_score', 0),
-                "sections_found": structure_validation.get('sections_found', [])
-            }
-        }
-    
-    def save_as_markdown(self, case_study_data: Dict[str, Any], output_path: str = None) -> Dict[str, Any]:
-        """
-        Save case study analysis as a structured markdown file
+        Generate an AI-designed professional client-ready report with intelligent layout and visualizations
         
         Args:
             case_study_data: The case study data from lookup_case_study
-            output_path: Optional custom output path
+            format_type: "pdf", "html", or "both"
             
         Returns:
-            Dictionary with save result and file path
+            Dictionary with generated report file paths and metadata
         """
         try:
             from datetime import datetime
             import os
             
-            # Create output directory if it doesn't exist
-            output_dir = output_path or os.path.join(os.getcwd(), "output", "case_studies")
+            # Create output directory
+            output_dir = os.path.join(os.getcwd(), "output", "client_reports")
             os.makedirs(output_dir, exist_ok=True)
             
-            # Generate filename
+            # Generate base filename
             company_domain = case_study_data.get('company_domain', 'unknown')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"case_study_{company_domain}_{timestamp}.md"
-            filepath = os.path.join(output_dir, filename)
+            base_filename = f"case_study_report_{company_domain}_{timestamp}"
             
-            # Build markdown content
-            markdown_content = self._build_markdown_content(case_study_data)
-            
-            # Write to file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(markdown_content)
-            
-            logger.info(f"Case study saved as markdown: {filepath}")
-            
-            return {
+            results = {
                 "success": True,
-                "filepath": filepath,
-                "filename": filename,
-                "size": len(markdown_content)
+                "company": company_domain,
+                "generated_files": [],
+                "timestamp": timestamp
             }
             
+            # STEP 1: Let AI analyze data and design the report
+            logger.info("🤖 AI analyzing case study data and designing report layout...")
+            report_design = await self._ai_design_report(case_study_data)
+            
+            # STEP 2: Prepare data based on AI recommendations  
+            enhanced_data = await self._prepare_ai_designed_data(case_study_data, report_design)
+            
+            # STEP 3: Generate HTML report using AI design
+            html_path = await self._generate_ai_designed_html_report(enhanced_data, report_design, output_dir, base_filename)
+            results["generated_files"].append({"type": "html", "path": html_path})
+            results["ai_design"] = report_design
+            
+            # STEP 4: Generate PDF if requested
+            if format_type in ["pdf", "both"]:
+                pdf_path = await self._generate_pdf_report(enhanced_data, output_dir, base_filename, html_path)
+                results["generated_files"].append({"type": "pdf", "path": pdf_path})
+            
+            logger.info(f"✅ Generated AI-designed client report(s) for {company_domain}")
+            return results
+            
         except Exception as e:
-            logger.error(f"Error saving case study as markdown: {str(e)}")
+            logger.error(f"Error generating client report: {str(e)}")
             return {
                 "success": False,
                 "error": str(e)
             }
     
-    def _build_markdown_content(self, case_study_data: Dict[str, Any]) -> str:
-        """Build structured markdown content from case study data"""
+    async def _ai_design_report(self, case_study_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Use AI to analyze the case study data and design an optimal report layout
+        
+        Args:
+            case_study_data: Raw case study data to analyze
+            
+        Returns:
+            Dictionary containing AI-designed report structure and recommendations
+        """
+        try:
+            # Use the OpenAI API from the web search tool
+            openai_tool = self.web_search_manager.openai_websearch
+            if not openai_tool.openai_api_key:
+                # Fallback to default design
+                return self._get_default_report_design()
+            
+            import openai
+            openai.api_key = openai_tool.openai_api_key
+            
+            # Analyze the data structure
+            all_results = case_study_data.get('all_results', [])
+            company = case_study_data.get('company_domain', 'Unknown')
+            
+            # Prepare data summary for AI analysis
+            data_summary = {
+                "company": company,
+                "total_results": len(all_results),
+                "has_verified_case_studies": any(r.get('ai_analysis', {}).get('is_case_study', False) for r in all_results),
+                "relevance_scores": [r.get('relevance_score', 0) for r in all_results],
+                "case_study_types": [r.get('ai_analysis', {}).get('case_study_type', 'unknown') for r in all_results if r.get('ai_analysis', {}).get('is_case_study', False)],
+                "key_insights": [insight for r in all_results for insight in r.get('ai_analysis', {}).get('key_insights', [])],
+                "has_metrics": any('metric' in str(r.get('ai_analysis', {}).get('key_insights', [])).lower() for r in all_results)
+            }
+            
+            prompt = f"""
+            You are a professional report designer. Analyze this case study data and design an optimal client presentation report.
+            
+            Data Analysis:
+            {json.dumps(data_summary, indent=2)}
+            
+            Design a professional report with the following considerations:
+            1. What's the most compelling story this data tells?
+            2. What charts/visualizations would best represent this data?
+            3. What sections should be included for maximum client impact?
+            4. What color scheme and design style would be most professional?
+            5. What executive summary would be most persuasive?
+            
+            Respond with a JSON object containing:
+            {{
+                "report_title": "Compelling title for the report",
+                "executive_summary": "2-3 sentence executive summary highlighting key findings",
+                "recommended_sections": [
+                    {{
+                        "title": "Section name",
+                        "content_type": "text|chart|stats|highlight",
+                        "description": "What this section should contain",
+                        "priority": 1-5
+                    }}
+                ],
+                "recommended_charts": [
+                    {{
+                        "type": "bar|line|pie|doughnut|scatter|radar",
+                        "title": "Chart title",
+                        "data_source": "What data to visualize",
+                        "reasoning": "Why this chart is recommended"
+                    }}
+                ],
+                "color_scheme": {{
+                    "primary": "#hex_color",
+                    "secondary": "#hex_color", 
+                    "accent": "#hex_color",
+                    "style": "professional|modern|corporate|creative"
+                }},
+                "key_messages": [
+                    "Key message 1",
+                    "Key message 2", 
+                    "Key message 3"
+                ],
+                "design_rationale": "Why this design approach was chosen"
+            }}
+            
+            Focus on creating a report that tells a compelling business story and demonstrates clear value to the client.
+            """
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4",  # Use GPT-4 for better design thinking
+                messages=[
+                    {"role": "system", "content": "You are an expert business intelligence report designer who creates compelling, data-driven presentations for executive audiences. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1500,
+                temperature=0.7  # Allow some creativity in design
+            )
+            
+            # Parse AI design response
+            import json
+            design = json.loads(response.choices[0].message.content.strip())
+            
+            logger.info(f"🎨 AI designed report: {design.get('report_title', 'Custom Report')}")
+            return design
+            
+        except Exception as e:
+            logger.error(f"Error in AI report design: {str(e)}")
+            return self._get_default_report_design()
+    
+    def _get_default_report_design(self) -> Dict[str, Any]:
+        """Fallback report design if AI is not available"""
+        return {
+            "report_title": "Case Study Analysis Report",
+            "executive_summary": "Comprehensive analysis of relevant case studies and business intelligence insights.",
+            "recommended_sections": [
+                {"title": "Executive Summary", "content_type": "text", "description": "Key findings overview", "priority": 1},
+                {"title": "Performance Metrics", "content_type": "stats", "description": "Statistical overview", "priority": 2},
+                {"title": "Data Visualization", "content_type": "chart", "description": "Charts and graphs", "priority": 3},
+                {"title": "Top Results", "content_type": "highlight", "description": "Best case studies found", "priority": 4}
+            ],
+            "recommended_charts": [
+                {"type": "bar", "title": "Relevance Scores", "data_source": "relevance_scores", "reasoning": "Shows quality ranking"},
+                {"type": "doughnut", "title": "Case Study Types", "data_source": "case_study_types", "reasoning": "Shows distribution"}
+            ],
+            "color_scheme": {
+                "primary": "#2c3e50",
+                "secondary": "#3498db", 
+                "accent": "#e74c3c",
+                "style": "professional"
+            },
+            "key_messages": [
+                "Comprehensive case study analysis completed",
+                "Data-driven insights identified",
+                "Actionable intelligence provided"
+            ],
+            "design_rationale": "Clean, professional design optimized for executive presentation"
+        }
+    
+    async def _prepare_ai_designed_data(self, case_study_data: Dict[str, Any], report_design: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare data according to AI design recommendations"""
+        try:
+            enhanced_data = case_study_data.copy()
+            enhanced_data['ai_design'] = report_design
+            
+            # Prepare data based on recommended charts
+            all_results = case_study_data.get('all_results', [])
+            charts_data = {}
+            
+            for chart in report_design.get('recommended_charts', []):
+                data_source = chart.get('data_source', '')
+                chart_type = chart.get('type', 'bar')
+                
+                if data_source == 'relevance_scores':
+                    charts_data['relevance_scores'] = {
+                        'data': [r.get('relevance_score', 0) for r in all_results[:5]],
+                        'labels': [r.get('title', 'Unknown')[:30] + '...' for r in all_results[:5]],
+                        'type': chart_type
+                    }
+                elif data_source == 'case_study_types':
+                    types = self._analyze_case_study_types(all_results)
+                    charts_data['case_study_types'] = {
+                        'data': list(types.values()),
+                        'labels': list(types.keys()),
+                        'type': chart_type
+                    }
+                elif data_source == 'insights_timeline':
+                    # Create timeline if recommended
+                    charts_data['insights_timeline'] = {
+                        'data': [len(r.get('ai_analysis', {}).get('key_insights', [])) for r in all_results[:5]],
+                        'labels': [f"Result {i+1}" for i in range(min(5, len(all_results)))],
+                        'type': chart_type
+                    }
+            
+            enhanced_data['ai_charts'] = charts_data
+            
+            # Prepare statistics based on design
+            enhanced_data['ai_statistics'] = {
+                'total_results': len(all_results),
+                'avg_relevance_score': sum(r.get('relevance_score', 0) for r in all_results) / max(len(all_results), 1),
+                'content_read_count': sum(1 for r in all_results if r.get('content_read', False)),
+                'verified_case_studies': sum(1 for r in all_results if r.get('ai_analysis', {}).get('is_case_study', False)),
+                'key_insights_total': sum(len(r.get('ai_analysis', {}).get('key_insights', [])) for r in all_results)
+            }
+            
+            return enhanced_data
+            
+        except Exception as e:
+            logger.error(f"Error preparing AI-designed data: {str(e)}")
+            return await self._prepare_report_data(case_study_data)
+    
+    async def _prepare_report_data(self, case_study_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare and enhance data for report generation"""
+        try:
+            enhanced_data = case_study_data.copy()
+            
+            # Extract metrics and insights
+            all_results = case_study_data.get('all_results', [])
+            
+            # Prepare chart data
+            enhanced_data['charts'] = {
+                'relevance_scores': [r.get('relevance_score', 0) for r in all_results[:5]],
+                'result_titles': [r.get('title', 'Unknown')[:30] + '...' for r in all_results[:5]],
+                'case_study_types': self._analyze_case_study_types(all_results),
+                'key_metrics': self._extract_all_metrics(all_results)
+            }
+            
+            # Prepare summary statistics
+            enhanced_data['statistics'] = {
+                'total_results': len(all_results),
+                'avg_relevance_score': sum(r.get('relevance_score', 0) for r in all_results) / max(len(all_results), 1),
+                'content_read_count': sum(1 for r in all_results if r.get('content_read', False)),
+                'verified_case_studies': sum(1 for r in all_results if r.get('ai_analysis', {}).get('is_case_study', False))
+            }
+            
+            return enhanced_data
+            
+        except Exception as e:
+            logger.error(f"Error preparing report data: {str(e)}")
+            return case_study_data
+    
+    def _analyze_case_study_types(self, results: List[Dict]) -> Dict[str, int]:
+        """Analyze and categorize case study types"""
+        types = {}
+        for result in results:
+            case_type = result.get('ai_analysis', {}).get('case_study_type', 'other')
+            types[case_type] = types.get(case_type, 0) + 1
+        return types
+    
+    def _extract_all_metrics(self, results: List[Dict]) -> List[str]:
+        """Extract all metrics from case study results"""
+        all_metrics = []
+        for result in results:
+            metrics = result.get('ai_analysis', {}).get('key_insights', [])
+            all_metrics.extend(metrics)
+        return list(set(all_metrics))[:10]  # Top 10 unique metrics
+    
+    async def _generate_ai_designed_html_report(self, data: Dict[str, Any], report_design: Dict[str, Any], output_dir: str, base_filename: str) -> str:
+        """Generate HTML report using AI-designed layout and styling"""
+        try:
+            html_content = self._build_ai_designed_html_template(data, report_design)
+            
+            html_path = os.path.join(output_dir, f"{base_filename}.html")
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            logger.info(f"Generated AI-designed HTML report: {html_path}")
+            return html_path
+            
+        except Exception as e:
+            logger.error(f"Error generating AI-designed HTML report: {str(e)}")
+            # Fallback to standard report
+            return await self._generate_html_report(data, output_dir, base_filename)
+    
+    def _build_ai_designed_html_template(self, data: Dict[str, Any], report_design: Dict[str, Any]) -> str:
+        """Build HTML template based on AI design recommendations"""
         from datetime import datetime
         
-        company_domain = case_study_data.get('company_domain', 'Unknown Company')
-        top_result = case_study_data.get('top_result', {})
-        summary = case_study_data.get('summary', {})
-        all_results = case_study_data.get('all_results', [])
+        company = data.get('company_domain', 'Unknown Company')
+        design = report_design
+        ai_charts = data.get('ai_charts', {})
+        ai_stats = data.get('ai_statistics', {})
+        top_result = data.get('top_result', {})
         
-        # Build markdown content
-        markdown = f"""# Case Study Analysis: {company_domain}
-
-*Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
-
-## Summary
-
-**Company:** {company_domain}  
-**Total Results Found:** {case_study_data.get('total_found', 0)}  
-**Analysis Status:** {'✅ Success' if case_study_data.get('ok') else '❌ Failed'}
-
-## Top Case Study
-
-"""
+        # Get AI-designed styling
+        colors = design.get('color_scheme', {})
+        primary_color = colors.get('primary', '#2c3e50')
+        secondary_color = colors.get('secondary', '#3498db')
+        accent_color = colors.get('accent', '#e74c3c')
         
-        if top_result:
-            markdown += f"""### {summary.get('title', 'No title')}
-
-**URL:** [{summary.get('url', 'No URL')}]({summary.get('url', '#')})  
-**Relevance Score:** {summary.get('relevance_score', 0)}
-
-#### Description
-{summary.get('description', 'No description available')}
-
-#### Key Metrics
-"""
+        # Build sections based on AI recommendations
+        sections_html = self._build_ai_sections(data, design)
+        
+        # Build charts based on AI recommendations
+        charts_html, charts_js = self._build_ai_charts(ai_charts, design)
+        
+        html_template = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{design.get('report_title', 'AI-Designed Case Study Report')} - {company}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, {primary_color} 0%, {secondary_color} 100%);
+            color: #333;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, {primary_color} 0%, {secondary_color} 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 2.8em;
+            font-weight: 300;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }}
+        .header p {{
+            margin: 15px 0 0 0;
+            opacity: 0.9;
+            font-size: 1.2em;
+        }}
+        .executive-summary {{
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            padding: 30px;
+            margin: 0;
+            border-left: 5px solid {accent_color};
+        }}
+        .executive-summary h2 {{
+            color: {primary_color};
+            margin-top: 0;
+        }}
+        .content {{
+            padding: 30px;
+        }}
+        .ai-section {{
+            margin: 30px 0;
+            padding: 25px;
+            border-radius: 12px;
+            border-left: 4px solid {secondary_color};
+        }}
+        .ai-section.stats {{
+            background: linear-gradient(135deg, #e8f5e8 0%, #d4edda 100%);
+        }}
+        .ai-section.chart {{
+            background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+        }}
+        .ai-section.highlight {{
+            background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .stat-card {{
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border-left: 4px solid {accent_color};
+        }}
+        .stat-number {{
+            font-size: 2.5em;
+            font-weight: bold;
+            color: {accent_color};
+            margin-bottom: 8px;
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 0.95em;
+            font-weight: 500;
+        }}
+        .charts-container {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+            margin: 30px 0;
+        }}
+        .chart-wrapper {{
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            height: 400px;
+        }}
+        .top-result {{
+            background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%);
+            border: 2px solid #4caf50;
+            border-radius: 15px;
+            padding: 30px;
+            margin: 30px 0;
+            box-shadow: 0 4px 12px rgba(76, 175, 80, 0.2);
+        }}
+        .top-result h3 {{
+            color: #2e7d32;
+            margin-top: 0;
+            font-size: 1.5em;
+        }}
+        .key-messages {{
+            background: linear-gradient(135deg, #f3e5f5 0%, #e1bee7 100%);
+            padding: 25px;
+            border-radius: 12px;
+            margin: 25px 0;
+        }}
+        .key-messages ul {{
+            list-style: none;
+            padding: 0;
+        }}
+        .key-messages li {{
+            background: white;
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #9c27b0;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        }}
+        .design-note {{
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            font-style: italic;
+            color: #666;
+            margin: 20px 0;
+            border-left: 3px solid {secondary_color};
+        }}
+        .footer {{
+            background: {primary_color};
+            color: white;
+            padding: 25px;
+            text-align: center;
+        }}
+        @media print {{
+            body {{ background: white; }}
+            .container {{ box-shadow: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{design.get('report_title', 'AI-Designed Case Study Report')}</h1>
+            <p>{company} • Generated by AI on {datetime.now().strftime('%B %d, %Y')}</p>
+        </div>
+        
+        <div class="executive-summary">
+            <h2>🎯 Executive Summary</h2>
+            <p>{design.get('executive_summary', 'AI-powered analysis of case study data with intelligent insights.')}</p>
+        </div>
+        
+        <div class="content">
+            {sections_html}
             
-            key_metrics = summary.get('key_metrics', [])
-            if key_metrics:
-                for metric in key_metrics:
-                    markdown += f"- {metric}\n"
-            else:
-                markdown += "- No specific metrics found\n"
+            <div class="key-messages">
+                <h3>🔑 Key Messages</h3>
+                <ul>
+                    {''.join([f'<li>{msg}</li>' for msg in design.get('key_messages', [])])}
+                </ul>
+            </div>
             
-            markdown += f"""
-#### Content Preview
-{summary.get('content_preview', 'No content preview available')}
+            <div class="design-note">
+                <strong>AI Design Rationale:</strong> {design.get('design_rationale', 'Report designed using artificial intelligence to optimize presentation and impact.')}
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>🤖 AI-Designed Report • Generated by Intelligent Case Study Analysis Tool</p>
+        </div>
+    </div>
 
+    <script>
+        {charts_js}
+    </script>
+</body>
+</html>
 """
+        return html_template
+    
+    def _build_ai_sections(self, data: Dict[str, Any], design: Dict[str, Any]) -> str:
+        """Build HTML sections based on AI recommendations"""
+        sections_html = ""
+        ai_stats = data.get('ai_statistics', {})
+        top_result = data.get('top_result', {})
         
-        # Add all results section
-        markdown += """## All Results
+        # Sort sections by priority
+        sections = sorted(design.get('recommended_sections', []), key=lambda x: x.get('priority', 5))
+        
+        for section in sections:
+            title = section.get('title', 'Section')
+            content_type = section.get('content_type', 'text')
+            description = section.get('description', '')
+            
+            if content_type == 'stats':
+                sections_html += f"""
+                <div class="ai-section stats">
+                    <h3>📊 {title}</h3>
+                    <p>{description}</p>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-number">{ai_stats.get('total_results', 0)}</div>
+                            <div class="stat-label">Total Results</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{ai_stats.get('verified_case_studies', 0)}</div>
+                            <div class="stat-label">Verified Studies</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{ai_stats.get('avg_relevance_score', 0):.1f}</div>
+                            <div class="stat-label">Avg Score</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">{ai_stats.get('key_insights_total', 0)}</div>
+                            <div class="stat-label">Key Insights</div>
+                        </div>
+                    </div>
+                </div>
+                """
+            elif content_type == 'chart':
+                sections_html += f"""
+                <div class="ai-section chart">
+                    <h3>📈 {title}</h3>
+                    <p>{description}</p>
+                    <div class="charts-container" id="ai-charts-container">
+                        <!-- Charts will be inserted here by JavaScript -->
+                    </div>
+                </div>
+                """
+            elif content_type == 'highlight':
+                sections_html += f"""
+                <div class="ai-section highlight">
+                    <h3>🏆 {title}</h3>
+                    <p>{description}</p>
+                    <div class="top-result">
+                        <h4>{top_result.get('title', 'No title available')}</h4>
+                        <p><strong>URL:</strong> <a href="{top_result.get('url', '#')}" target="_blank">{top_result.get('url', 'No URL')}</a></p>
+                        <p><strong>Relevance Score:</strong> {top_result.get('relevance_score', 0)}/100</p>
+                        <p><strong>AI Analysis:</strong> {top_result.get('ai_analysis', {}).get('reasoning', 'Comprehensive case study analysis completed.')}</p>
+                    </div>
+                </div>
+                """
+            else:  # text
+                sections_html += f"""
+                <div class="ai-section">
+                    <h3>📝 {title}</h3>
+                    <p>{description}</p>
+                </div>
+                """
+        
+        return sections_html
+    
+    def _build_ai_charts(self, charts_data: Dict[str, Any], design: Dict[str, Any]) -> tuple:
+        """Build chart HTML and JavaScript based on AI recommendations"""
+        charts_html = ""
+        charts_js = ""
+        
+        chart_id = 0
+        for chart_rec in design.get('recommended_charts', []):
+            chart_id += 1
+            chart_type = chart_rec.get('type', 'bar')
+            chart_title = chart_rec.get('title', 'Chart')
+            data_source = chart_rec.get('data_source', '')
+            
+            if data_source in charts_data:
+                chart_data = charts_data[data_source]
+                
+                charts_html += f"""
+                <div class="chart-wrapper">
+                    <canvas id="aiChart{chart_id}"></canvas>
+                </div>
+                """
+                
+                # Build JavaScript for this chart
+                colors = ['rgba(52, 152, 219, 0.8)', 'rgba(231, 76, 60, 0.8)', 'rgba(46, 204, 113, 0.8)', 
+                         'rgba(155, 89, 182, 0.8)', 'rgba(241, 196, 15, 0.8)']
+                
+                if chart_type == 'doughnut' or chart_type == 'pie':
+                    charts_js += f"""
+                    const ctx{chart_id} = document.getElementById('aiChart{chart_id}').getContext('2d');
+                    new Chart(ctx{chart_id}, {{
+                        type: '{chart_type}',
+                        data: {{
+                            labels: {chart_data.get('labels', [])},
+                            datasets: [{{
+                                data: {chart_data.get('data', [])},
+                                backgroundColor: {colors}
+                            }}]
+                        }},
+                        options: {{
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {{
+                                title: {{
+                                    display: true,
+                                    text: '{chart_title}'
+                                }}
+                            }}
+                        }}
+                    }});
+                    """
+                else:  # bar, line, etc.
+                    charts_js += f"""
+                    const ctx{chart_id} = document.getElementById('aiChart{chart_id}').getContext('2d');
+                    new Chart(ctx{chart_id}, {{
+                        type: '{chart_type}',
+                        data: {{
+                            labels: {chart_data.get('labels', [])},
+                            datasets: [{{
+                                label: '{chart_title}',
+                                data: {chart_data.get('data', [])},
+                                backgroundColor: '{colors[0]}',
+                                borderColor: '{colors[0].replace("0.8", "1")}',
+                                borderWidth: 2
+                            }}]
+                        }},
+                        options: {{
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {{
+                                title: {{
+                                    display: true,
+                                    text: '{chart_title}'
+                                }}
+                            }},
+                            scales: {{
+                                y: {{
+                                    beginAtZero: true
+                                }}
+                            }}
+                        }}
+                    }});
+                    """
+        
+        # Insert charts into container
+        if charts_html:
+            charts_js = f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                const container = document.getElementById('ai-charts-container');
+                if (container) {{
+                    container.innerHTML = `{charts_html}`;
+                    setTimeout(() => {{
+                        {charts_js}
+                    }}, 100);
+                }}
+            }});
+            """
+        
+        return charts_html, charts_js
+    
+    async def _generate_html_report(self, data: Dict[str, Any], output_dir: str, base_filename: str) -> str:
+        """Generate professional HTML report with charts"""
+        try:
+            html_content = self._build_html_template(data)
+            
+            html_path = os.path.join(output_dir, f"{base_filename}.html")
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            logger.info(f"Generated HTML report: {html_path}")
+            return html_path
+            
+        except Exception as e:
+            logger.error(f"Error generating HTML report: {str(e)}")
+            raise
+    
+    def _build_html_template(self, data: Dict[str, Any]) -> str:
+        """Build professional HTML template with charts"""
+        from datetime import datetime
+        
+        company = data.get('company_domain', 'Unknown Company')
+        top_result = data.get('top_result', {})
+        charts = data.get('charts', {})
+        stats = data.get('statistics', {})
+        
+        # Prepare chart data for JavaScript
+        relevance_scores = charts.get('relevance_scores', [])
+        result_titles = charts.get('result_titles', [])
+        case_types = charts.get('case_study_types', {})
+        
+        html_template = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Case Study Analysis Report - {company}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 2.5em;
+            font-weight: 300;
+        }}
+        .header p {{
+            margin: 10px 0 0 0;
+            opacity: 0.9;
+            font-size: 1.1em;
+        }}
+        .content {{
+            padding: 30px;
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            border-left: 4px solid #3498db;
+        }}
+        .stat-number {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #3498db;
+            margin-bottom: 5px;
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 0.9em;
+        }}
+        .charts-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin: 30px 0;
+        }}
+        .chart-container {{
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            height: 400px;
+        }}
+        .top-result {{
+            background: #e8f5e8;
+            border: 1px solid #28a745;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }}
+        .top-result h3 {{
+            color: #28a745;
+            margin-top: 0;
+        }}
+        .url-link {{
+            color: #007bff;
+            text-decoration: none;
+            word-break: break-all;
+        }}
+        .url-link:hover {{
+            text-decoration: underline;
+        }}
+        .insights-list {{
+            list-style: none;
+            padding: 0;
+        }}
+        .insights-list li {{
+            background: #fff3cd;
+            margin: 5px 0;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 3px solid #ffc107;
+        }}
+        .footer {{
+            background: #f8f9fa;
+            padding: 20px;
+            text-align: center;
+            color: #666;
+            border-top: 1px solid #dee2e6;
+        }}
+        @media print {{
+            body {{ background: white; }}
+            .container {{ box-shadow: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Case Study Analysis Report</h1>
+            <p>{company} • Generated on {datetime.now().strftime('%B %d, %Y')}</p>
+        </div>
+        
+        <div class="content">
+            <!-- Statistics Overview -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number">{stats.get('total_results', 0)}</div>
+                    <div class="stat-label">Total Results Found</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{stats.get('verified_case_studies', 0)}</div>
+                    <div class="stat-label">Verified Case Studies</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{stats.get('avg_relevance_score', 0):.1f}</div>
+                    <div class="stat-label">Avg Relevance Score</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{stats.get('content_read_count', 0)}</div>
+                    <div class="stat-label">Pages Analyzed</div>
+                </div>
+            </div>
+            
+            <!-- Charts -->
+            <div class="charts-grid">
+                <div class="chart-container">
+                    <canvas id="relevanceChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="typeChart"></canvas>
+                </div>
+            </div>
+            
+            <!-- Top Result -->
+            <div class="top-result">
+                <h3>🏆 Top Case Study Result</h3>
+                <h4>{top_result.get('title', 'No title available')}</h4>
+                <p><strong>URL:</strong> <a href="{top_result.get('url', '#')}" class="url-link" target="_blank">{top_result.get('url', 'No URL')}</a></p>
+                <p><strong>Relevance Score:</strong> {top_result.get('relevance_score', 0)}/100</p>
+                <p><strong>Description:</strong> {top_result.get('description', 'No description available')[:300]}...</p>
+                
+                <h5>Key Insights:</h5>
+                <ul class="insights-list">
+                    {' '.join([f'<li>{insight}</li>' for insight in top_result.get('ai_analysis', {}).get('key_insights', ['No insights available'])[:5]])}
+                </ul>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>Generated by AI-Powered Case Study Analysis Tool • Confidential Business Intelligence</p>
+        </div>
+    </div>
 
-| Rank | Title | URL | Score |
-|------|-------|-----|-------|
+    <script>
+        // Relevance Scores Chart
+        const ctx1 = document.getElementById('relevanceChart').getContext('2d');
+        new Chart(ctx1, {{
+            type: 'bar',
+            data: {{
+                labels: {result_titles},
+                datasets: [{{
+                    label: 'Relevance Score',
+                    data: {relevance_scores},
+                    backgroundColor: 'rgba(52, 152, 219, 0.8)',
+                    borderColor: 'rgba(52, 152, 219, 1)',
+                    borderWidth: 1
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Case Study Relevance Scores'
+                    }}
+                }},
+                scales: {{
+                    y: {{
+                        beginAtZero: true,
+                        max: 100
+                    }}
+                }}
+            }}
+        }});
+
+        // Case Study Types Chart
+        const ctx2 = document.getElementById('typeChart').getContext('2d');
+        new Chart(ctx2, {{
+            type: 'doughnut',
+            data: {{
+                labels: {list(case_types.keys())},
+                datasets: [{{
+                    data: {list(case_types.values())},
+                    backgroundColor: [
+                        'rgba(255, 99, 132, 0.8)',
+                        'rgba(54, 162, 235, 0.8)',
+                        'rgba(255, 205, 86, 0.8)',
+                        'rgba(75, 192, 192, 0.8)',
+                        'rgba(153, 102, 255, 0.8)'
+                    ]
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Case Study Types Distribution'
+                    }}
+                }}
+            }}
+        }});
+    </script>
+</body>
+</html>
 """
-        
-        for i, result in enumerate(all_results[:10], 1):  # Top 10 results
-            title = result.get('title', 'No title')[:50] + ('...' if len(result.get('title', '')) > 50 else '')
-            url = result.get('url', 'No URL')
-            score = result.get('relevance_score', 0)
-            markdown += f"| {i} | {title} | [{url}]({url}) | {score} |\n"
-        
-        # Add current behavior analysis
-        markdown += """
-## Current Behavior Analysis
-
-### What the tool does today
-1. **Domain scoping rule** - Takes the prospect company name and prepends a site: filter
-2. **Search query example:** `{company_domain} case study site:{company_domain}.com`
-3. **Results ranking** - Ranks by recency and numeric KPI keywords
-
-### Why this misidentifies stories
-- Current approach finds stories where the prospect is the **vendor**, not the **customer**
-- This returns "How [Company] helped..." stories instead of "[Company] as customer" stories
-- Domain scoping should be flipped to rep company domain
-
-### Needed Changes
-1. **Domain flip** - Filter by rep company domain instead of prospect domain
-2. **Negative filters** - Exclude "How [prospect] helped..." patterns
-3. **Schema tweak** - Better identification of customer vs vendor stories
-4. **Ranking weights** - Updated scoring for customer success stories
-5. **Better metrics** - Focus on customer outcome metrics
-6. **Updated tests** - Test cases for improved accuracy
-
----
-
-*This analysis was generated by the Case Study Tool and saved as markdown for easy sharing and reference.*
-"""
-        
-        return markdown
+        return html_template
+    
+    async def _generate_pdf_report(self, data: Dict[str, Any], output_dir: str, base_filename: str, html_path: str) -> str:
+        """Generate PDF report from HTML using pdfkit"""
+        try:
+            pdf_path = os.path.join(output_dir, f"{base_filename}.pdf")
+            
+            # First try pdfkit (since you installed it)
+            try:
+                import pdfkit
+                
+                # PDF options for better rendering
+                options = {
+                    'page-size': 'A4',
+                    'orientation': 'Portrait',
+                    'margin-top': '0.75in',
+                    'margin-right': '0.75in',
+                    'margin-bottom': '0.75in',
+                    'margin-left': '0.75in',
+                    'encoding': 'UTF-8',
+                    'no-outline': None,
+                    'enable-local-file-access': None,
+                    'javascript-delay': 1000,  # Wait for charts to load
+                    'disable-smart-shrinking': None,
+                    'print-media-type': None
+                }
+                
+                logger.info(f"🔄 Generating PDF with pdfkit: {pdf_path}")
+                pdfkit.from_file(html_path, pdf_path, options=options)
+                
+                # Verify PDF was created and has content
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:  # At least 1KB
+                    logger.info(f"✅ PDF generated successfully: {pdf_path}")
+                    logger.info(f"📄 PDF size: {os.path.getsize(pdf_path)} bytes")
+                    return pdf_path
+                else:
+                    logger.error("❌ PDF file was not created or is too small")
+                    
+            except ImportError:
+                logger.error("❌ pdfkit not installed. Run: pip install pdfkit")
+            except Exception as e:
+                logger.error(f"❌ pdfkit error: {str(e)}")
+                # Check if wkhtmltopdf is available
+                if "wkhtmltopdf" in str(e).lower():
+                    logger.error("💡 wkhtmltopdf is required. Install from: https://wkhtmltopdf.org/downloads.html")
+            
+            # Try direct wkhtmltopdf command if pdfkit fails
+            try:
+                import subprocess
+                logger.info("🔄 Trying direct wkhtmltopdf command...")
+                
+                result = subprocess.run([
+                    'wkhtmltopdf', 
+                    '--page-size', 'A4',
+                    '--orientation', 'Portrait',
+                    '--margin-top', '0.75in',
+                    '--margin-right', '0.75in',
+                    '--margin-bottom', '0.75in',
+                    '--margin-left', '0.75in',
+                    '--encoding', 'UTF-8',
+                    '--enable-local-file-access',
+                    '--javascript-delay', '1000',
+                    html_path,
+                    pdf_path
+                ], capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0 and os.path.exists(pdf_path):
+                    logger.info(f"✅ PDF generated with wkhtmltopdf: {pdf_path}")
+                    return pdf_path
+                else:
+                    logger.error(f"❌ wkhtmltopdf failed: {result.stderr}")
+                    
+            except FileNotFoundError:
+                logger.error("❌ wkhtmltopdf not found in PATH")
+            except subprocess.TimeoutExpired:
+                logger.error("❌ wkhtmltopdf timed out")
+            except Exception as e:
+                logger.error(f"❌ wkhtmltopdf error: {str(e)}")
+            
+            # Final fallback: Create instructions file
+            logger.warning("⚠️ PDF generation failed, creating instructions file")
+            instructions_path = os.path.join(output_dir, f"{base_filename}_pdf_instructions.txt")
+            with open(instructions_path, 'w') as f:
+                f.write("PDF Generation Instructions\n")
+                f.write("="*50 + "\n\n")
+                f.write(f"HTML report available at: {html_path}\n\n")
+                f.write("To generate PDF, install wkhtmltopdf:\n")
+                f.write("1. Download from: https://wkhtmltopdf.org/downloads.html\n")
+                f.write("2. Install and add to your PATH\n")
+                f.write("3. Re-run the report generation\n\n")
+                f.write("Alternative: Open the HTML file in a browser and print to PDF\n")
+            
+            return instructions_path
+            
+        except Exception as e:
+            logger.error(f"💥 Critical error in PDF generation: {str(e)}")
+            raise
 
 class ApolloProcessingTool:
     """
